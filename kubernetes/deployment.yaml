@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cc-agent
+  labels:
+    app: cc-agent
+    version: "1.0.0"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cc-agent
+  template:
+    metadata:
+      labels:
+        app: cc-agent
+        version: "1.0.0"
+    spec:
+      # Run as non-root (matches the Dockerfile user)
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+
+      containers:
+        - name: agent
+          image: your-registry/cc-agent:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          # Resource limits — tune for your capability's workload
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+
+          # Environment variables from the secret
+          envFrom:
+            - secretRef:
+                name: cc-agent-secrets
+
+          # Additional non-secret env vars
+          env:
+            - name: PORT
+              value: "8080"
+            - name: LOG_LEVEL
+              value: "info"
+            - name: COINBASE_NETWORK
+              value: "base-mainnet"
+
+          # Liveness probe — restarts the pod if the agent hangs
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            failureThreshold: 3
+            timeoutSeconds: 5
+
+          # Readiness probe — removes pod from service until it's ready
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 3
+
+          # Mount audit log to persistent storage
+          volumeMounts:
+            - name: audit-logs
+              mountPath: /app/logs
+
+      volumes:
+        - name: audit-logs
+          # In production, use a PersistentVolumeClaim for durable audit logs
+          emptyDir: {}
+
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30

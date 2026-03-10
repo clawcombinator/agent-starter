@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cc-agent
+  labels:
+    app: cc-agent
+spec:
+  type: ClusterIP
+  selector:
+    app: cc-agent
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: http     # Named port from Deployment (8080)

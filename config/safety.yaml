@@ -1,0 +1,67 @@
+# ============================================================
+# Safety configuration
+# Values here are defaults. Environment variables override:
+#   DAILY_BUDGET_USD, TRANSACTION_LIMIT_USD,
+#   HUMAN_APPROVAL_THRESHOLD_USD, RATE_LIMIT_PER_MINUTE
+# ============================================================
+
+budget_constraints:
+  # Hard daily cap — operations that would exceed this are blocked
+  daily_spend_usd:
+    hard_limit: 100
+    # Soft limit — agent continues operating but logs a warning
+    soft_limit: 80
+    alert_threshold: 0.8        # Fraction of hard_limit that triggers soft warning
+
+  transaction_limits:
+    # Single-transaction cap — blocks any individual payment above this
+    max_single_payment_usd: 500
+    # Escalation threshold — payments above this require human approval
+    requires_approval_above_usd: 1000
+
+rate_limits:
+  # Token bucket [algorithm that allows burst traffic up to burst_allowance
+  # then refills at requests_per_minute / 60 per second]
+  requests_per_minute: 60
+  burst_allowance: 90            # Up to 1.5x the per-minute rate as a burst
+
+escalation_rules:
+  # Each rule specifies a condition and the action taken
+  - condition: transaction_amount_usd > 1000
+    action: require_human_approval
+    timeout_minutes: 60
+    notify:
+      - sponsor_webhook
+
+  - condition: capability_confidence < 0.7
+    action: request_human_review
+    notify:
+      - sponsor_webhook
+
+  - condition: kill_switch_activated
+    action: immediate_pause
+    notify:
+      - sponsor_webhook
+      - cc_safety_team_webhook
+
+  - condition: daily_spend_pct > 0.8
+    action: log_warning
+    # Does not block — only logs a warning to the audit trail
+
+audit_logging:
+  enabled: true
+  # Local path (always written)
+  local_path: ./logs/audit.jsonl
+  # Optional: ship entries to a remote sink
+  # remote_webhook: https://your-logging-service/ingest
+  retention_days: 365
+  include_pii: false             # Strip personally-identifiable information from logs
+
+kill_switch:
+  # The kill switch can be activated:
+  # 1. Automatically — if safety rules fire
+  # 2. Manually — via POST /admin/kill (if you add that endpoint)
+  # Once active, ALL operations are blocked until the process is restarted.
+  auto_activate_on:
+    - repeated_safety_violations: 5   # 5 consecutive blocked operations
+    - audit_chain_broken: true        # Tamper-detection triggered

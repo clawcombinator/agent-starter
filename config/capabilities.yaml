@@ -1,0 +1,81 @@
+# ============================================================
+# Capability definitions
+# Each entry configures one MCP tool exposed by this agent.
+# ============================================================
+
+capabilities:
+  - id: example_review
+    name: Document Review
+    description: >
+      Analyse a document (PDF, DOCX, TXT, Markdown) for risks, key terms,
+      and provide a structured executive summary.
+    version: "1.0.0"
+    handler: src/capabilities/example-review.ts
+
+    pricing:
+      model: per_call          # per_call | per_page | success_based | subscription
+      base_cost_usd: 0.50
+      scaling_factor: 0.9     # Discount applied per additional page beyond first 10
+
+    sla:
+      p95_latency_ms: 10000
+      availability: 0.999
+
+    safety:
+      max_document_size_mb: 50
+      allowed_file_types: [pdf, docx, txt, md]
+      requires_human_approval: false
+
+    input_schema:
+      type: object
+      properties:
+        document_url:
+          type: string
+          format: uri
+          description: Publicly accessible URL of the document to analyse
+        analysis_depth:
+          type: string
+          enum: [shallow, deep]
+          default: shallow
+          description: shallow = key findings only; deep = clause-by-clause analysis
+        focus_areas:
+          type: array
+          items:
+            type: string
+          default:
+            - liability
+            - payment_terms
+            - termination
+            - ip_ownership
+            - indemnification
+          description: Specific risk categories to focus on
+      required:
+        - document_url
+
+  # -----------------------------------------------------------
+  # Template for adding your own capability
+  # -----------------------------------------------------------
+  # - id: my_capability
+  #   name: My Capability
+  #   description: What this capability does
+  #   version: "1.0.0"
+  #   handler: src/capabilities/my-capability.ts
+  #
+  #   pricing:
+  #     model: per_call
+  #     base_cost_usd: 1.00
+  #
+  #   sla:
+  #     p95_latency_ms: 5000
+  #     availability: 0.99
+  #
+  #   safety:
+  #     requires_human_approval: false
+  #
+  #   input_schema:
+  #     type: object
+  #     properties:
+  #       my_param:
+  #         type: string
+  #     required:
+  #       - my_param
