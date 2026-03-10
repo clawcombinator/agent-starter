@@ -3,9 +3,13 @@
 // the Express HTTP server.
 //
 // Endpoints:
-//   GET  /health          — health check (wallet, safety state)
+//   GET  /health          — health check (providers, safety state)
 //   GET  /capabilities    — list registered MCP tools
 //   POST /mcp             — MCP protocol handler (JSON-RPC)
+//
+// Provider initialisation is best-effort: if a provider's
+// credentials are absent or invalid the agent still starts but
+// that provider is simply not registered with the router.
 // ============================================================
 
 import 'dotenv/config';
@@ -14,7 +18,10 @@ import winston from 'winston';
 
 import { AuditLogger } from './audit.js';
 import { SafetyMonitor } from './safety.js';
-import { AgentWallet } from './wallet.js';
+import { PaymentRouter } from './router.js';
+import { CoinbaseProvider } from './providers/coinbase.js';
+import { StripeProvider } from './providers/stripe.js';
+import { X402Provider } from './providers/x402.js';
 import { AgentMCPServer } from './mcp-server.js';
 import { CCAPEconomic } from './ccap/economic.js';
 import { CCAPComposition } from './ccap/compose.js';
@@ -51,8 +58,8 @@ async function bootstrap(): Promise<void> {
     budget: {
       dailyLimitUsd: Number(process.env['DAILY_BUDGET_USD'] ?? 100),
       softLimitUsd: Number(process.env['DAILY_BUDGET_USD'] ?? 100) * 0.8,
-      transactionLimitUsd: Number(process.env['TRANSACTION_LIMIT_USD'] ?? 500),
-      humanApprovalThresholdUsd: Number(process.env['HUMAN_APPROVAL_THRESHOLD_USD'] ?? 1000),
+      transactionLimitUsd: Number(process.env['TRANSACTION_LIMIT_USD'] ?? 50),
+      humanApprovalThresholdUsd: Number(process.env['HUMAN_APPROVAL_THRESHOLD_USD'] ?? 75),
     },
     rateLimits: {
       requestsPerMinute: Number(process.env['RATE_LIMIT_PER_MINUTE'] ?? 60),
@@ -69,34 +76,76 @@ async function bootstrap(): Promise<void> {
 
   const safety = new SafetyMonitor(safetyConfig, audit);
 
-  // 3. Wallet
-  const wallet = new AgentWallet(
-    process.env['COINBASE_API_KEY_NAME'] ?? '',
-    process.env['COINBASE_API_KEY_PRIVATE_KEY'] ?? '',
-    process.env['COINBASE_NETWORK'] ?? 'base-sepolia',
-  );
+  // 3. Payment router — the central routing layer
+  const router = new PaymentRouter(safety, audit);
 
-  let walletConnected = false;
-  try {
-    await wallet.initialize();
-    walletConnected = true;
-    logger.info('Wallet initialised', { address: wallet.address });
-    audit.record('wallet_initialised', { address: wallet.address });
-  } catch (err) {
-    logger.warn('Wallet failed to initialise — running without payment capability', {
-      error: String(err),
-    });
-    audit.record('wallet_init_failed', { error: String(err) });
+  // 4. Initialise providers (only if credentials are configured)
+  //    Each is independent; one failing does not block the others.
+
+  // --- Coinbase AgentKit (crypto payments) ---
+  if (process.env['COINBASE_API_KEY_NAME'] && process.env['COINBASE_API_KEY_PRIVATE_KEY']) {
+    const coinbase = new CoinbaseProvider(
+      process.env['COINBASE_API_KEY_NAME'],
+      process.env['COINBASE_API_KEY_PRIVATE_KEY'],
+      process.env['COINBASE_NETWORK'] ?? 'base-sepolia',
+    );
+    try {
+      await coinbase.initialize();
+      router.registerProvider(coinbase);
+      logger.info('Coinbase provider registered', { address: coinbase.address });
+      audit.record('provider_initialised', { provider: 'coinbase', address: coinbase.address });
+    } catch (err) {
+      logger.warn('Coinbase provider failed to initialise', { error: String(err) });
+      audit.record('provider_init_failed', { provider: 'coinbase', error: String(err) });
+    }
+  } else {
+    logger.info('Coinbase provider skipped — COINBASE_API_KEY_NAME or COINBASE_API_KEY_PRIVATE_KEY not set');
   }
 
-  // 4. CCAP economic and composition layers
+  // --- Stripe (card / bank-transfer payments) ---
+  if (process.env['STRIPE_SECRET_KEY']) {
+    const stripe = new StripeProvider(process.env['STRIPE_SECRET_KEY']);
+    try {
+      await stripe.initialize();
+      router.registerProvider(stripe);
+      logger.info('Stripe provider registered');
+      audit.record('provider_initialised', { provider: 'stripe' });
+    } catch (err) {
+      logger.warn('Stripe provider failed to initialise', { error: String(err) });
+      audit.record('provider_init_failed', { provider: 'stripe', error: String(err) });
+    }
+  } else {
+    logger.info('Stripe provider skipped — STRIPE_SECRET_KEY not set');
+  }
+
+  // --- x402 (HTTP-native micropayments) ---
+  if (process.env['X402_WALLET_ADDRESS'] && process.env['X402_PRIVATE_KEY']) {
+    const x402 = new X402Provider(
+      process.env['X402_WALLET_ADDRESS'],
+      process.env['X402_PRIVATE_KEY'],
+    );
+    try {
+      await x402.initialize();
+      router.registerProvider(x402);
+      logger.info('x402 provider registered');
+      audit.record('provider_initialised', { provider: 'x402' });
+    } catch (err) {
+      logger.warn('x402 provider failed to initialise', { error: String(err) });
+      audit.record('provider_init_failed', { provider: 'x402', error: String(err) });
+    }
+  } else {
+    logger.info('x402 provider skipped — X402_WALLET_ADDRESS or X402_PRIVATE_KEY not set');
+  }
+
+  // 5. CCAP economic layer (router-backed)
   const economic = new CCAPEconomic(
-    wallet,
+    router,
     safety,
     audit,
     process.env['CC_API_URL'] ?? 'https://api.clawcombinator.ai/v1',
   );
 
+  // 6. CCAP composition layer (agent discovery and invocation)
   const composition = new CCAPComposition(
     economic,
     audit,
@@ -104,29 +153,30 @@ async function bootstrap(): Promise<void> {
     process.env['CC_API_KEY'] ?? '',
   );
 
-  // Silence unused-variable warning (composition available for future route handlers)
+  // Suppress unused-variable warning (composition available for future route handlers)
   void composition;
 
-  // 5. MCP server — register capabilities
-  const mcpServer = new AgentMCPServer(safety, audit);
+  // 7. MCP server — register capabilities and economic tools
+  const mcpServer = new AgentMCPServer(safety, audit, economic, router);
   mcpServer.registerCapability(new ExampleReviewCapability());
 
-  // 6. Express HTTP server
+  // 8. Express HTTP server
   const app = express();
   app.use(express.json({ limit: '1mb' }));
   app.use(requestLogger);
 
   // GET /health
-  app.get('/health', (_req: Request, res: Response) => {
-    const walletStatus = walletConnected
-      ? { connected: true, address: wallet.address ?? undefined, network: process.env['COINBASE_NETWORK'] ?? 'base-sepolia' }
-      : { connected: false };
+  app.get('/health', async (_req: Request, res: Response) => {
+    const providerNames = router.listProviders();
 
     const body: HealthResponse = {
       status: safety.isKillSwitchActive ? 'error' : 'ok',
       version: process.env['CC_AGENT_VERSION'] ?? '1.0.0',
       uptimeSeconds: Math.floor((Date.now() - startTime) / 1000),
-      wallet: walletStatus,
+      providers: {
+        count: providerNames.length,
+        names: providerNames,
+      },
       safety: {
         killSwitchActive: safety.isKillSwitchActive,
         dailySpendUsd: safety.dailySpendUsd,
@@ -144,13 +194,8 @@ async function bootstrap(): Promise<void> {
   });
 
   // POST /mcp — MCP JSON-RPC handler
-  // The MCP SDK provides a built-in HTTP handler via StreamableHTTPServerTransport.
-  // For the starter kit we implement a lightweight pass-through that handles
-  // initialize / tools/list / tools/call directly.
   app.post('/mcp', safetyMiddleware(safety), async (req: Request, res: Response) => {
     try {
-      // Delegate to the MCP server's internal handler.
-      // In production wire up StreamableHTTPServerTransport from the SDK.
       const { method, params, id } = req.body as {
         method: string;
         params?: unknown;
@@ -201,15 +246,6 @@ async function bootstrap(): Promise<void> {
           return;
         }
 
-        // Dispatch to capability
-        const caps = mcpServer.listCapabilities();
-        const cap = caps.find((c) => c.id === name);
-        if (!cap) {
-          res.json({ jsonrpc: '2.0', id, error: { code: -32601, message: `Unknown tool: ${name}` } });
-          return;
-        }
-
-        // We need the actual capability instance for execution.
         const result = await mcpServer.capabilities.get(name)?.execute(args);
 
         res.json({
@@ -239,6 +275,7 @@ async function bootstrap(): Promise<void> {
       port,
       agentId: process.env['CC_AGENT_ID'] ?? 'agent-starter',
       version: process.env['CC_AGENT_VERSION'] ?? '1.0.0',
+      providers: router.listProviders(),
     });
     audit.record('server_started', { port });
   });

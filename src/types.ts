@@ -2,6 +2,10 @@
 // Shared TypeScript interfaces for the CC Agent Starter Kit.
 // All modules import from here — keep this the canonical [single
 // authoritative] source of type definitions.
+//
+// Provider-level types (PaymentProvider, PaymentParams, etc.)
+// live in src/providers/types.ts. This file holds the higher-
+// level CCAP protocol types that sit above the provider layer.
 // ============================================================
 
 // ------------------------------------------------------------
@@ -69,30 +73,10 @@ export interface AuditVerifyResult {
 }
 
 // ------------------------------------------------------------
-// Wallet
-// ------------------------------------------------------------
-
-export interface PayParams {
-  amount: number;
-  currency: string;             // e.g. 'USDC', 'ETH'
-  recipient: string;            // wallet address
-  memo: string;
-}
-
-export interface PayResult {
-  transactionHash: string;
-  idempotencyKey: string;
-  fromCache: boolean;
-}
-
-export interface WalletStatus {
-  address: string;
-  network: string;
-  balances: Record<string, string>;
-}
-
-// ------------------------------------------------------------
 // CCAP Economic
+// Wallet-specific PayParams / PayResult removed — those live in
+// providers/coinbase.ts. Here we define the CCAP-level types
+// that callers of CCAPEconomic use.
 // ------------------------------------------------------------
 
 export interface InvoiceParams {
@@ -111,19 +95,14 @@ export interface InvoiceResult {
   currency: string;
 }
 
+/** CCAP-level payment params. method is optional; router picks best provider. */
 export interface PaymentParams {
   amount: number;
   currency: string;
   recipientWallet: string;
   memo: string;
   invoiceId?: string;           // Optional: link payment to an invoice
-}
-
-export interface PaymentResult {
-  transactionId: string;
-  status: 'completed' | 'pending' | 'failed';
-  timestamp: string;
-  costUsd: number;
+  method?: import('./providers/types.js').PaymentMethod; // Routing hint
 }
 
 export interface BalanceParams {
@@ -253,10 +232,9 @@ export interface HealthResponse {
   status: 'ok' | 'degraded' | 'error';
   version: string;
   uptimeSeconds: number;
-  wallet: {
-    connected: boolean;
-    address?: string;
-    network?: string;
+  providers: {
+    count: number;
+    names: string[];
   };
   safety: {
     killSwitchActive: boolean;

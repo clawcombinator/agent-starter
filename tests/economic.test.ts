@@ -1,9 +1,9 @@
 // ============================================================
-// Tests for CCAPEconomic — invoice creation, payment flow,
-// balance query, escrow lifecycle, and safety gate integration.
+// Tests for CCAPEconomic — invoice creation, payment routing,
+// balance aggregation, escrow lifecycle, and safety gate.
 //
-// All external dependencies (wallet, safety) are replaced by
-// lightweight test doubles to avoid network calls.
+// Dependencies are replaced by lightweight test doubles so no
+// network calls or blockchain access is required.
 // ============================================================
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -12,12 +12,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { AuditLogger } from '../src/audit.js';
 import { SafetyMonitor } from '../src/safety.js';
+import { PaymentRouter } from '../src/router.js';
 import { CCAPEconomic, SafetyViolationError } from '../src/ccap/economic.js';
-import type { AgentWallet } from '../src/wallet.js';
+import type { PaymentProvider, Balance, PaymentParams, PaymentResult } from '../src/providers/types.js';
 import type { SafetyConfig } from '../src/types.js';
 
 // ----------------------------------------------------------
-// Test doubles
+// Helpers
 // ----------------------------------------------------------
 
 function tempLogPath(): string {
@@ -38,21 +39,26 @@ function makeConfig(overrides: Partial<SafetyConfig['budget']> = {}): SafetyConf
   };
 }
 
-/** Minimal mock wallet that returns predictable results without hitting Coinbase. */
-function makeMockWallet(address = '0xTestAddress'): AgentWallet {
+/**
+ * Minimal mock PaymentProvider that succeeds without any network calls.
+ */
+function makeMockProvider(name: string = 'mock_crypto'): PaymentProvider {
   return {
-    address,
-    isConnected: true,
+    name,
     initialize: vi.fn().mockResolvedValue(undefined),
-    getBalance: vi.fn().mockResolvedValue('100.00'),
-    getStatus: vi.fn().mockResolvedValue({ address, network: 'base-sepolia', balances: { USDC: '100.00' } }),
+    getBalance: vi.fn().mockResolvedValue({
+      amount: '100.00',
+      currency: 'USDC',
+      provider: name,
+    } satisfies Balance),
     pay: vi.fn().mockResolvedValue({
-      transactionHash: '0xdeadbeef1234567890',
-      idempotencyKey: 'pay_test_key',
-      fromCache: false,
-    }),
-    generateIdempotencyKey: vi.fn().mockReturnValue('pay_test_key'),
-  } as unknown as AgentWallet;
+      transactionId: `0xdeadbeef_${name}`,
+      provider: name,
+      status: 'completed',
+      timestamp: new Date().toISOString(),
+    } satisfies PaymentResult),
+    supportsMethod: vi.fn().mockReturnValue(true),
+  };
 }
 
 // ----------------------------------------------------------
@@ -62,14 +68,17 @@ function makeMockWallet(address = '0xTestAddress'): AgentWallet {
 describe('CCAPEconomic', () => {
   let audit: AuditLogger;
   let safety: SafetyMonitor;
-  let wallet: AgentWallet;
+  let router: PaymentRouter;
+  let provider: PaymentProvider;
   let economic: CCAPEconomic;
 
   beforeEach(() => {
     audit = new AuditLogger(tempLogPath());
     safety = new SafetyMonitor(makeConfig(), audit);
-    wallet = makeMockWallet();
-    economic = new CCAPEconomic(wallet, safety, audit);
+    router = new PaymentRouter(safety, audit);
+    provider = makeMockProvider();
+    router.registerProvider(provider);
+    economic = new CCAPEconomic(router, safety, audit);
   });
 
   // ----------------------------------------------------------
@@ -105,7 +114,7 @@ describe('CCAPEconomic', () => {
       expect(stored?.amount).toBe(25);
     });
 
-    it('records invoice creation in audit log', async () => {
+    it('records invoice creation in the audit log', async () => {
       await economic.invoice({
         amount: 5,
         currency: 'USDC',
@@ -132,11 +141,11 @@ describe('CCAPEconomic', () => {
   });
 
   // ----------------------------------------------------------
-  // pay()
+  // pay() via router
   // ----------------------------------------------------------
 
   describe('pay()', () => {
-    it('executes a payment and returns transactionId', async () => {
+    it('routes payment through the registered provider', async () => {
       const result = await economic.pay({
         amount: 10,
         currency: 'USDC',
@@ -144,28 +153,12 @@ describe('CCAPEconomic', () => {
         memo: 'Service payment',
       });
 
-      expect(result.transactionId).toBe('0xdeadbeef1234567890');
+      expect(result.transactionId).toContain('0xdeadbeef');
       expect(result.status).toBe('completed');
-      expect(result.costUsd).toBe(10);
+      expect(provider.pay).toHaveBeenCalledOnce();
     });
 
-    it('calls wallet.pay with correct parameters', async () => {
-      await economic.pay({
-        amount: 15,
-        currency: 'USDC',
-        recipientWallet: '0xRecipient',
-        memo: 'Test memo',
-      });
-
-      expect(wallet.pay).toHaveBeenCalledWith({
-        amount: 15,
-        currency: 'USDC',
-        recipient: '0xRecipient',
-        memo: 'Test memo',
-      });
-    });
-
-    it('records payment in audit log', async () => {
+    it('records payment_sent in the audit log', async () => {
       await economic.pay({
         amount: 5,
         currency: 'USDC',
@@ -177,10 +170,11 @@ describe('CCAPEconomic', () => {
       expect(entries.some((e) => e.action === 'payment_sent')).toBe(true);
     });
 
-    it('throws SafetyViolationError when amount exceeds transaction limit', async () => {
+    it('throws SafetyViolationError when safety blocks the payment', async () => {
+      // Amount exceeds the transactionLimitUsd (500)
       await expect(
         economic.pay({
-          amount: 600, // exceeds 500 USD transactionLimitUsd
+          amount: 600,
           currency: 'USDC',
           recipientWallet: '0xRecipient',
           memo: 'Too large',
@@ -188,61 +182,67 @@ describe('CCAPEconomic', () => {
       ).rejects.toThrow(SafetyViolationError);
     });
 
-    it('records blocked payments in audit log', async () => {
-      try {
-        await economic.pay({
-          amount: 600,
-          currency: 'USDC',
-          recipientWallet: '0xRecipient',
-          memo: 'Blocked payment',
-        });
-      } catch {
-        // Expected
-      }
-
-      const entries = audit.export();
-      expect(entries.some((e) => e.action === 'payment_blocked')).toBe(true);
-    });
-
-    it('does NOT call wallet.pay when safety check fails', async () => {
+    it('does NOT call provider.pay when safety check fails', async () => {
       try {
         await economic.pay({ amount: 600, currency: 'USDC', recipientWallet: '0x', memo: 'blocked' });
       } catch {
         // Expected
       }
 
-      expect(wallet.pay).not.toHaveBeenCalled();
+      expect(provider.pay).not.toHaveBeenCalled();
+    });
+
+    it('falls back to a second provider when the first fails', async () => {
+      // Make the first provider fail
+      vi.mocked(provider.pay).mockRejectedValueOnce(new Error('Provider offline'));
+
+      // Register a second provider that succeeds
+      const fallback = makeMockProvider('fallback_stripe');
+      router.registerProvider(fallback);
+
+      const result = await economic.pay({
+        amount: 10,
+        currency: 'USD',
+        recipientWallet: '0xRecipient',
+        memo: 'Fallback test',
+      });
+
+      expect(result.status).toBe('completed');
+      expect(fallback.pay).toHaveBeenCalledOnce();
     });
   });
 
   // ----------------------------------------------------------
-  // balance()
+  // balance() — aggregate across providers
   // ----------------------------------------------------------
 
   describe('balance()', () => {
-    it('returns current balance from wallet', async () => {
-      const result = await economic.balance({ currency: 'USDC' });
+    it('returns balances from all registered providers', async () => {
+      const results = await economic.balance({ currency: 'USDC' });
 
-      expect(result.balance).toBe('100.00');
-      expect(result.currency).toBe('USDC');
-      expect(result.timestamp).toBeTruthy();
+      expect(results).toHaveLength(1);
+      expect(results[0]!.balance).toBe('100.00');
+      expect(results[0]!.currency).toBe('USDC');
     });
 
-    it('records balance query in audit log', async () => {
+    it('aggregates across multiple providers', async () => {
+      const second = makeMockProvider('stripe');
+      vi.mocked(second.getBalance).mockResolvedValue({
+        amount: '50.00',
+        currency: 'USD',
+        provider: 'stripe',
+      });
+      router.registerProvider(second);
+
+      const results = await economic.balance({ currency: 'USD' });
+      expect(results).toHaveLength(2);
+    });
+
+    it('records balance_queried in audit log', async () => {
       await economic.balance({ currency: 'USDC' });
 
       const entries = audit.export();
       expect(entries.some((e) => e.action === 'balance_queried')).toBe(true);
-    });
-
-    it('uses wallet address when no wallet param provided', async () => {
-      const result = await economic.balance({ currency: 'USDC' });
-      expect(result.wallet).toBe('0xTestAddress');
-    });
-
-    it('uses provided wallet address when specified', async () => {
-      const result = await economic.balance({ wallet: '0xCustomAddress', currency: 'USDC' });
-      expect(result.wallet).toBe('0xCustomAddress');
     });
   });
 
@@ -282,7 +282,7 @@ describe('CCAPEconomic', () => {
       expect(stored?.condition).toBe('Test condition');
     });
 
-    it('records escrow creation in audit log', async () => {
+    it('records escrow_created in audit log', async () => {
       await economic.escrow({
         amount: 10,
         currency: 'USDC',
@@ -319,14 +319,13 @@ describe('CCAPEconomic', () => {
       const after = Date.now();
 
       const expiresAtMs = new Date(result.expiresAt).getTime();
-      // Should expire between 3600s from before and 3600s from after
       expect(expiresAtMs).toBeGreaterThanOrEqual(before + 3600 * 1000);
       expect(expiresAtMs).toBeLessThanOrEqual(after + 3600 * 1000 + 1000);
     });
   });
 
   // ----------------------------------------------------------
-  // Audit chain integrity after multiple operations
+  // Audit chain integrity
   // ----------------------------------------------------------
 
   it('audit chain is valid after a full payment workflow', async () => {

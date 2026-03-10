@@ -1,6 +1,10 @@
 # ============================================================
 # Capability definitions
 # Each entry configures one MCP tool exposed by this agent.
+#
+# Economic tools (pay, balance, invoice, escrow, list_providers,
+# provider_status) are built-in and do not need entries here.
+# Only add entries for domain-specific capabilities.
 # ============================================================
 
 capabilities:

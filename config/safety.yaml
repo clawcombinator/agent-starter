@@ -15,9 +15,9 @@ budget_constraints:
 
   transaction_limits:
     # Single-transaction cap — blocks any individual payment above this
-    max_single_payment_usd: 500
+    max_single_payment_usd: 50
     # Escalation threshold — payments above this require human approval
-    requires_approval_above_usd: 1000
+    requires_approval_above_usd: 75
 
 rate_limits:
   # Token bucket [algorithm that allows burst traffic up to burst_allowance
@@ -27,7 +27,7 @@ rate_limits:
 
 escalation_rules:
   # Each rule specifies a condition and the action taken
-  - condition: transaction_amount_usd > 1000
+  - condition: transaction_amount_usd > 75
     action: require_human_approval
     timeout_minutes: 60
     notify:
@@ -65,3 +65,37 @@ kill_switch:
   auto_activate_on:
     - repeated_safety_violations: 5   # 5 consecutive blocked operations
     - audit_chain_broken: true        # Tamper-detection triggered
+
+# ============================================================
+# Provider configuration
+# Controls per-provider safety behaviour.
+# ============================================================
+
+providers:
+  # --- Coinbase AgentKit ---
+  coinbase:
+    enabled: true
+    # Crypto payments are irreversible — enforce tighter per-transaction cap
+    transaction_limit_usd: 50
+    supported_methods: [crypto]
+    network: base-sepolia          # Override with COINBASE_NETWORK
+
+  # --- Stripe ---
+  stripe:
+    enabled: true
+    # Cards are reversible (chargebacks) — slightly looser limits acceptable
+    transaction_limit_usd: 200
+    supported_methods: [card, bank_transfer]
+
+  # --- x402 ---
+  x402:
+    enabled: true
+    # x402 is designed for micropayments — enforce a strict cap
+    transaction_limit_usd: 5
+    supported_methods: [x402]
+
+routing:
+  # Default optimisation strategy when no hint is provided
+  default_optimise: cheapest
+  # Number of fallback providers to attempt before giving up
+  max_fallback_attempts: 3

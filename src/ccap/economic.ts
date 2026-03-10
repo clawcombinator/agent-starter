@@ -1,16 +1,28 @@
 // ============================================================
-// CCAPEconomic — implements the economic primitives of CCAP:
+// CCAPEconomic — economic primitives of CCAP:
 // invoice, pay, balance, escrow.
 //
-// Every payment goes through SafetyMonitor before execution.
-// Every action is appended to the AuditLogger.
-// Escrow records are held in-memory (TODO: persist to Redis/DB).
+// pay()     → delegates to PaymentRouter (multi-provider routing)
+// balance() → delegates to PaymentRouter.getAggregateBalance()
+// invoice() → creates a structured JSON invoice; settlement
+//             happens via the router through any configured provider
+// escrow()  → KEPT as a CC-native primitive: time-locked hold
+//             with provider-agnostic settlement. No existing
+//             payment provider solves this generically.
+//
+// Every action is audited. Every payment passes the SafetyMonitor
+// via the router before execution.
 // ============================================================
 
 import crypto from 'node:crypto';
 import type { AuditLogger } from '../audit.js';
 import type { SafetyMonitor } from '../safety.js';
-import type { AgentWallet } from '../wallet.js';
+import type { PaymentRouter } from '../router.js';
+import type {
+  Balance,
+  PaymentResult,
+  RoutingHint,
+} from '../providers/types.js';
 import type {
   BalanceParams,
   BalanceResult,
@@ -20,7 +32,6 @@ import type {
   InvoiceParams,
   InvoiceResult,
   PaymentParams,
-  PaymentResult,
 } from '../types.js';
 
 // In-memory stores — replace with durable storage for production
@@ -29,14 +40,18 @@ const escrowStore = new Map<string, EscrowRecord>();
 
 export class CCAPEconomic {
   constructor(
-    private readonly wallet: AgentWallet,
+    private readonly router: PaymentRouter,
     private readonly safety: SafetyMonitor,
     private readonly audit: AuditLogger,
     readonly ccApiUrl: string = 'https://api.clawcombinator.ai/v1',
   ) {}
 
   // ----------------------------------------------------------
-  // invoice — create a payment request
+  // invoice — create a structured payment request
+  //
+  // Returns a JSON invoice that can be settled via any provider
+  // through the router. The paymentUrl is a CC-hosted page;
+  // the invoiceId can also be passed directly to pay().
   // ----------------------------------------------------------
 
   async invoice(params: InvoiceParams): Promise<InvoiceResult> {
@@ -51,7 +66,6 @@ export class CCAPEconomic {
       currency: params.currency,
     };
 
-    // Persist locally
     invoiceStore.set(invoiceId, { ...params, ...result });
 
     this.audit.record('invoice_created', {
@@ -66,39 +80,48 @@ export class CCAPEconomic {
   }
 
   // ----------------------------------------------------------
-  // pay — execute a payment after safety checks
+  // pay — route payment through PaymentRouter
+  //
+  // Safety checks live inside the router. This method is now
+  // a thin wrapper that translates CCAP PaymentParams into the
+  // provider-level params and delegates entirely to the router.
   // ----------------------------------------------------------
 
-  async pay(params: PaymentParams): Promise<PaymentResult> {
-    // Safety gate — must pass before any funds move
-    const check = await this.safety.checkOperation({
-      type: 'payment',
-      costUsd: params.amount,
-      description: `Payment to ${params.recipientWallet}: ${params.memo}`,
-      metadata: { invoiceId: params.invoiceId },
-    });
-
-    if (!check.allowed) {
-      this.audit.record('payment_blocked', {
-        reason: check.reason,
-        params,
-        requiresHumanApproval: check.requiresHumanApproval ?? false,
-      });
-      throw new SafetyViolationError(check.reason ?? 'Safety check failed', check);
-    }
-
-    // Execute on-chain transfer
-    const result = await this.wallet.pay({
+  async pay(
+    params: PaymentParams,
+    hint?: RoutingHint,
+  ): Promise<PaymentResult> {
+    const routerParams = {
       amount: params.amount,
       currency: params.currency,
       recipient: params.recipientWallet,
       memo: params.memo,
-    });
+      method: params.method,
+      idempotencyKey: params.invoiceId
+        ? `inv_pay_${params.invoiceId}`
+        : undefined,
+    };
 
-    // Commit the spend to the budget tracker
-    this.safety.recordSpend(params.amount);
+    let result: PaymentResult;
 
-    // Optionally mark invoice as paid
+    try {
+      result = await this.router.route(routerParams, hint);
+    } catch (err) {
+      // Re-wrap router errors as SafetyViolationError when safety-blocked
+      // so existing callers that catch SafetyViolationError still work
+      if (err instanceof Error && err.name === 'RouterError') {
+        const routerErr = err as { code?: string };
+        if (routerErr.code === 'SAFETY_BLOCKED') {
+          throw new SafetyViolationError(err.message, {
+            allowed: false,
+            reason: err.message,
+          });
+        }
+      }
+      throw err;
+    }
+
+    // Mark invoice as paid if one was referenced
     if (params.invoiceId) {
       const inv = invoiceStore.get(params.invoiceId);
       if (inv) {
@@ -106,43 +129,48 @@ export class CCAPEconomic {
       }
     }
 
+    // Mirror the payment_sent audit entry so existing audit test consumers
+    // continue to see it (router already audits at the routing layer)
     this.audit.record('payment_sent', {
-      transactionHash: result.transactionHash,
+      transactionId: result.transactionId,
+      provider: result.provider,
       amount: params.amount,
       currency: params.currency,
       recipientWallet: params.recipientWallet,
       memo: params.memo,
       invoiceId: params.invoiceId,
-      fromCache: result.fromCache,
     });
 
-    return {
-      transactionId: result.transactionHash,
-      status: 'completed',
-      timestamp: new Date().toISOString(),
-      costUsd: params.amount,
-    };
-  }
-
-  // ----------------------------------------------------------
-  // balance — query wallet balance
-  // ----------------------------------------------------------
-
-  async balance(params: BalanceParams): Promise<BalanceResult> {
-    const bal = await this.wallet.getBalance(params.currency);
-    const result: BalanceResult = {
-      wallet: params.wallet ?? this.wallet.address ?? 'unknown',
-      currency: params.currency,
-      balance: bal,
-      timestamp: new Date().toISOString(),
-    };
-
-    this.audit.record('balance_queried', { currency: params.currency, balance: bal });
     return result;
   }
 
   // ----------------------------------------------------------
-  // escrow — lock funds with a timeout
+  // balance — aggregate balance across all providers
+  // ----------------------------------------------------------
+
+  async balance(params: BalanceParams): Promise<BalanceResult[]> {
+    const balances: Balance[] = await this.router.getAggregateBalance(params.currency);
+
+    this.audit.record('balance_queried', {
+      currency: params.currency,
+      providers: balances.map((b) => b.provider),
+    });
+
+    // Map to CCAP BalanceResult format
+    return balances.map((b) => ({
+      wallet: params.wallet ?? b.provider,
+      currency: b.currency,
+      balance: b.amount,
+      timestamp: new Date().toISOString(),
+    }));
+  }
+
+  // ----------------------------------------------------------
+  // escrow — time-locked hold with provider-agnostic settlement
+  //
+  // This is CC's gap-filling contribution: no existing payment
+  // provider offers cross-provider escrow. The hold is recorded
+  // in the audit log; settlement can use any router provider.
   // ----------------------------------------------------------
 
   async escrow(params: EscrowParams): Promise<EscrowResult> {
@@ -184,7 +212,7 @@ export class CCAPEconomic {
       expiresAt,
     });
 
-    // Schedule expiry check
+    // Schedule automatic expiry
     setTimeout(() => void this.expireEscrow(escrowId), params.timeoutSeconds * 1000);
 
     return {
@@ -214,8 +242,7 @@ export class CCAPEconomic {
 
     escrowStore.set(escrowId, { ...record, status: 'expired' });
     this.audit.record('escrow_expired', { escrowId });
-
-    // In a real implementation, refund the locked funds here
+    // In production, release locked funds back to the originating wallet here
   }
 
   private generateInvoiceId(): string {
@@ -226,7 +253,7 @@ export class CCAPEconomic {
 }
 
 // ----------------------------------------------------------
-// Custom error type — carries the SafetyResult for callers
+// SafetyViolationError — carries the safety result
 // ----------------------------------------------------------
 
 export class SafetyViolationError extends Error {
