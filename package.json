@@ -13,7 +13,8 @@
     "test:safety": "vitest run tests/safety.test.ts",
     "test:watch": "vitest",
     "apply": "tsx scripts/apply.ts",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "demo": "tsx demo/run-demo.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
