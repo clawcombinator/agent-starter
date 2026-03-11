@@ -14,7 +14,8 @@
     "test:watch": "vitest",
     "apply": "tsx scripts/apply.ts",
     "lint": "tsc --noEmit",
-    "demo": "tsx demo/run-demo.ts"
+    "demo": "tsx demo/run-demo.ts",
+    "demo:marketplace": "tsx demo/run-marketplace.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
