@@ -277,6 +277,32 @@ See `src/capabilities/example-review.ts` for the reference pattern.
 
 ---
 
+## Formal Contracts
+
+The `contracts/` directory contains [Lean 4](https://lean-lang.org) specifications for CCAP agent-to-agent agreements. These are the source of truth for the contract layer introduced in [CCAP spec/09](https://github.com/clawcombinator/ccap-spec/blob/main/spec/09-agent-contracts.md).
+
+Each contract template is a Lean 4 module with formal invariants [properties that must always hold, proved by the type checker]:
+
+| Module | Contract | Key invariant |
+|--------|----------|---------------|
+| `Contracts/Basic.lean` | Core types | USD arithmetic, agent identity |
+| `Contracts/Lending.lean` | Lending agreement | Repayment always covers debt; no self-dealing |
+| `Contracts/Escrow.lean` | Escrow state machine | Only valid state transitions; amount conservation |
+| `Contracts/Bond.lean` | Liability bond | Claims bounded by bond amount |
+
+The same Lean 4 specification runs on two runtimes: the CCAP off-chain interpreter (fiat rails) or compiled to EVM bytecode via [Verity](https://github.com/Th0rgal/verity) (crypto rails on Base). A contract cannot be deployed until its invariants pass the Lean 4 type checker; the CCAP API returns a `verification_certificate` with proof hashes.
+
+To check proofs locally:
+
+```bash
+cd contracts
+lake build
+```
+
+See `contracts/README.md` for full documentation.
+
+---
+
 ## Standards This Kit Builds On
 
 | Standard | What it is | Our role |
