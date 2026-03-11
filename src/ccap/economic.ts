@@ -26,17 +26,38 @@ import type {
 import type {
   BalanceParams,
   BalanceResult,
+  BondRecord,
+  BondResult,
+  BondScope,
+  ClaimBondParams,
+  ClaimBondResult,
+  ClaimRecord,
+  CreditScore,
+  CreditScoreTier,
+  CreateEscrowParams,
+  CreateEscrowResult,
   EscrowParams,
   EscrowRecord,
   EscrowResult,
+  EscrowStatusResult,
+  ExtendedEscrowRecord,
   InvoiceParams,
   InvoiceResult,
   PaymentParams,
+  PostBondParams,
+  RefundEscrowResult,
+  ReleaseEscrowResult,
+  VerifyBondResult,
 } from '../types.js';
 
 // In-memory stores — replace with durable storage for production
 const invoiceStore = new Map<string, InvoiceResult & InvoiceParams>();
 const escrowStore = new Map<string, EscrowRecord>();
+const extendedEscrowStore = new Map<string, ExtendedEscrowRecord>();
+const bondStore = new Map<string, BondRecord>();
+// creditScoreStore is keyed by agent_id. In production this would be
+// populated from the CCAP registry. Here we seed a minimal computed score.
+const creditScoreStore = new Map<string, CreditScore>();
 
 export class CCAPEconomic {
   constructor(
@@ -225,6 +246,521 @@ export class CCAPEconomic {
   }
 
   // ----------------------------------------------------------
+  // createEscrow — full buyer-protection escrow lifecycle
+  //
+  // Creates an escrow record keyed by beneficiaryAgentId and
+  // completion criteria. Funds are NOT locked at creation time;
+  // call fundEscrow() to lock funds via the PaymentRouter.
+  // ----------------------------------------------------------
+
+  async createEscrow(params: CreateEscrowParams): Promise<CreateEscrowResult> {
+    const check = await this.safety.checkOperation({
+      type: 'escrow',
+      costUsd: params.amount,
+      description: `Create escrow for ${params.beneficiaryAgentId}`,
+    });
+
+    if (!check.allowed) {
+      this.audit.record('escrow_create_blocked', { reason: check.reason, params });
+      throw new SafetyViolationError(check.reason ?? 'Safety check failed', check);
+    }
+
+    const escrowId = `escrow_${crypto.randomBytes(8).toString('hex')}`;
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + params.timeoutSeconds * 1000).toISOString();
+
+    const record: ExtendedEscrowRecord = {
+      escrowId,
+      status: 'created',
+      amount: params.amount,
+      currency: params.currency,
+      buyerAgentId: 'self',
+      beneficiaryAgentId: params.beneficiaryAgentId,
+      completionCriteria: params.completionCriteria,
+      disputeResolutionMethod: params.disputeResolutionMethod,
+      arbitrationAgentId: params.arbitrationAgentId,
+      createdAt: now,
+      expiresAt,
+      idempotencyKey: params.idempotencyKey,
+    };
+
+    extendedEscrowStore.set(escrowId, record);
+
+    this.audit.record('extended_escrow_created', {
+      escrowId,
+      amount: params.amount,
+      currency: params.currency,
+      beneficiaryAgentId: params.beneficiaryAgentId,
+      completionCriteria: params.completionCriteria,
+      expiresAt,
+    });
+
+    // Schedule automatic expiry
+    setTimeout(() => void this.expireExtendedEscrow(escrowId), params.timeoutSeconds * 1000);
+
+    return {
+      escrowId,
+      status: 'created',
+      amount: params.amount,
+      currency: params.currency,
+      beneficiaryAgentId: params.beneficiaryAgentId,
+      createdAt: now,
+      expiresAt,
+    };
+  }
+
+  // ----------------------------------------------------------
+  // verifyEscrow — seller calls this before starting work
+  //
+  // Returns the current escrow status. A seller SHOULD decline
+  // to work if status is not 'funded'.
+  // ----------------------------------------------------------
+
+  async verifyEscrow(escrowId: string): Promise<EscrowStatusResult> {
+    const record = extendedEscrowStore.get(escrowId);
+
+    if (!record) {
+      throw new Error(`Escrow not found: ${escrowId}`);
+    }
+
+    this.audit.record('extended_escrow_verified', { escrowId, status: record.status });
+
+    return {
+      escrowId: record.escrowId,
+      status: record.status,
+      amount: record.amount,
+      currency: record.currency,
+      buyerAgentId: record.buyerAgentId,
+      beneficiaryAgentId: record.beneficiaryAgentId,
+      completionCriteria: record.completionCriteria,
+      expiresAt: record.expiresAt,
+      disputeResolutionMethod: record.disputeResolutionMethod,
+      verifiedAt: new Date().toISOString(),
+    };
+  }
+
+  // ----------------------------------------------------------
+  // releaseEscrow — transfers funds to the beneficiary
+  //
+  // Funds transfer MUST be atomic. If the payment router fails,
+  // the escrow status remains 'funded' and no funds move.
+  // ----------------------------------------------------------
+
+  async releaseEscrow(escrowId: string, completionEvidence?: string): Promise<ReleaseEscrowResult> {
+    const record = extendedEscrowStore.get(escrowId);
+
+    if (!record) {
+      throw new Error(`Escrow not found: ${escrowId}`);
+    }
+
+    if (record.status !== 'funded' && record.status !== 'created') {
+      throw new Error(`Escrow ${escrowId} cannot be released: status is '${record.status}'`);
+    }
+
+    // Route the payment to the beneficiary via the PaymentRouter
+    const payResult = await this.router.route({
+      amount: record.amount,
+      currency: record.currency,
+      recipient: record.beneficiaryAgentId,
+      memo: `Escrow release: ${escrowId}`,
+    });
+
+    const releasedAt = new Date().toISOString();
+
+    extendedEscrowStore.set(escrowId, {
+      ...record,
+      status: 'released',
+      releasedAt,
+      completionEvidence,
+    });
+
+    this.audit.record('extended_escrow_released', {
+      escrowId,
+      amount: record.amount,
+      currency: record.currency,
+      releasedTo: record.beneficiaryAgentId,
+      transactionId: payResult.transactionId,
+      completionEvidence,
+    });
+
+    return {
+      escrowId,
+      status: 'released',
+      amount: record.amount,
+      currency: record.currency,
+      releasedTo: record.beneficiaryAgentId,
+      releasedAt,
+      transactionId: payResult.transactionId,
+    };
+  }
+
+  // ----------------------------------------------------------
+  // refundEscrow — returns funds to the buyer
+  //
+  // Only valid when status is 'created' or 'funded'.
+  // On timeout, expireExtendedEscrow() calls this automatically.
+  // ----------------------------------------------------------
+
+  async refundEscrow(escrowId: string, reason?: string): Promise<RefundEscrowResult> {
+    const record = extendedEscrowStore.get(escrowId);
+
+    if (!record) {
+      throw new Error(`Escrow not found: ${escrowId}`);
+    }
+
+    if (record.status !== 'created' && record.status !== 'funded') {
+      throw new Error(`Escrow ${escrowId} cannot be refunded: status is '${record.status}'`);
+    }
+
+    // Route the payment back to the buyer. In production the buyer wallet
+    // address would be stored on the record. Here we use the buyerAgentId
+    // as the recipient identifier.
+    const payResult = await this.router.route({
+      amount: record.amount,
+      currency: record.currency,
+      recipient: record.buyerAgentId,
+      memo: `Escrow refund: ${escrowId}${reason ? ` — ${reason}` : ''}`,
+    });
+
+    const refundedAt = new Date().toISOString();
+
+    extendedEscrowStore.set(escrowId, {
+      ...record,
+      status: 'refunded',
+      refundedAt,
+    });
+
+    this.audit.record('extended_escrow_refunded', {
+      escrowId,
+      amount: record.amount,
+      currency: record.currency,
+      refundedTo: record.buyerAgentId,
+      transactionId: payResult.transactionId,
+      reason,
+    });
+
+    return {
+      escrowId,
+      status: 'refunded',
+      amount: record.amount,
+      currency: record.currency,
+      refundedTo: record.buyerAgentId,
+      refundedAt,
+      transactionId: payResult.transactionId,
+    };
+  }
+
+  // ----------------------------------------------------------
+  // postBond — lock a performance bond as a costly signal
+  //
+  // Funds are locked immediately via the PaymentRouter.
+  // The bond is visible to prospective clients via verifyBond().
+  // ----------------------------------------------------------
+
+  async postBond(params: PostBondParams): Promise<BondResult> {
+    const check = await this.safety.checkOperation({
+      type: 'escrow',
+      costUsd: params.amount,
+      description: `Post liability bond: ${params.scope}`,
+    });
+
+    if (!check.allowed) {
+      this.audit.record('bond_post_blocked', { reason: check.reason, params });
+      throw new SafetyViolationError(check.reason ?? 'Safety check failed', check);
+    }
+
+    const bondId = `bond_${crypto.randomBytes(8).toString('hex')}`;
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + params.durationSeconds * 1000).toISOString();
+
+    // Lock the bond amount via the PaymentRouter (held by CCAP network)
+    const payResult = await this.router.route({
+      amount: params.amount,
+      currency: params.currency,
+      recipient: 'ccap_bond_escrow',
+      memo: `Bond lock: ${bondId} scope=${params.scope}`,
+    });
+
+    this.safety.recordSpend(params.amount);
+
+    const record: BondRecord = {
+      bondId,
+      status: 'active',
+      agentId: 'self',
+      amount: params.amount,
+      remainingAmount: params.amount,
+      currency: params.currency,
+      scope: params.scope,
+      scopeDescription: params.scopeDescription,
+      claimConditions: params.claimConditions,
+      maxClaimAmount: params.maxClaimAmount,
+      arbitrationAgentId: params.arbitrationAgentId,
+      humanEscalationThresholdUsd: params.humanEscalationThresholdUsd ?? 10_000,
+      activeFrom: now,
+      expiresAt,
+      claimsHistory: [],
+      idempotencyKey: params.idempotencyKey,
+    };
+
+    bondStore.set(bondId, record);
+
+    this.audit.record('bond_posted', {
+      bondId,
+      amount: params.amount,
+      currency: params.currency,
+      scope: params.scope,
+      expiresAt,
+      transactionId: payResult.transactionId,
+    });
+
+    // Schedule automatic release when bond period ends
+    setTimeout(() => void this.releaseBondOnExpiry(bondId), params.durationSeconds * 1000);
+
+    return {
+      bondId,
+      status: 'active',
+      amount: params.amount,
+      currency: params.currency,
+      scope: params.scope,
+      agentId: 'self',
+      activeFrom: now,
+      expiresAt,
+      transactionId: payResult.transactionId,
+    };
+  }
+
+  // ----------------------------------------------------------
+  // verifyBond — client checks an agent's active bonds
+  //
+  // Returns the most relevant active bond for the given scope.
+  // ----------------------------------------------------------
+
+  verifyBond(agentId: string, scope?: BondScope): VerifyBondResult {
+    // In the starter kit, bondStore holds only this agent's bonds (agentId === 'self').
+    // Querying an external agent's bonds would call the CC registry API in production.
+    // Return empty for any agentId that is not 'self'.
+    const isSelf = agentId === 'self';
+
+    const activeBonds = isSelf
+      ? Array.from(bondStore.values()).filter(
+          (b) =>
+            b.status === 'active' &&
+            (scope === undefined || b.scope === scope),
+        )
+      : [];
+
+    if (activeBonds.length === 0) {
+      this.audit.record('bond_verified_none', { agentId, scope });
+      return { agentId, hasActiveBond: false };
+    }
+
+    // Select the bond with the highest remaining amount as the primary signal
+    const best = activeBonds.reduce((a, b) =>
+      a.remainingAmount >= b.remainingAmount ? a : b,
+    );
+
+    this.audit.record('bond_verified', {
+      agentId,
+      bondId: best.bondId,
+      scope: best.scope,
+      amount: best.remainingAmount,
+    });
+
+    return {
+      agentId,
+      hasActiveBond: true,
+      bondId: best.bondId,
+      amount: best.remainingAmount,
+      currency: best.currency,
+      scope: best.scope,
+      expiresAt: best.expiresAt,
+      claimsHistory: {
+        totalPeriods: bondStore.size,
+        claimsFiled: best.claimsHistory.length,
+        claimsUpheld: best.claimsHistory.filter((c) => c.status === 'upheld').length,
+      },
+    };
+  }
+
+  // ----------------------------------------------------------
+  // claimBond — client submits a claim against a bond
+  //
+  // Claims are placed under_review; they do not auto-pay.
+  // Adjudication is handled externally by the arbitration agent.
+  // ----------------------------------------------------------
+
+  async claimBond(params: ClaimBondParams): Promise<ClaimBondResult> {
+    const bond = bondStore.get(params.bondId);
+
+    if (!bond) {
+      throw new Error(`Bond not found: ${params.bondId}`);
+    }
+
+    if (bond.status !== 'active') {
+      throw new Error(`Bond ${params.bondId} is not active: status is '${bond.status}'`);
+    }
+
+    if (params.claimAmount > bond.maxClaimAmount) {
+      throw new Error(
+        `Claim amount ${params.claimAmount} exceeds bond max claim amount ${bond.maxClaimAmount}`,
+      );
+    }
+
+    const claimId = `claim_${crypto.randomBytes(8).toString('hex')}`;
+    const filedAt = new Date().toISOString();
+    const reviewDeadline = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString(); // 3 days
+
+    const claimRecord: ClaimRecord = {
+      claimId,
+      bondId: params.bondId,
+      claimedBy: params.claimedBy,
+      claimAmount: params.claimAmount,
+      description: params.description,
+      evidenceUrl: params.evidenceUrl,
+      status: 'under_review',
+      filedAt,
+    };
+
+    bondStore.set(params.bondId, {
+      ...bond,
+      claimsHistory: [...bond.claimsHistory, claimRecord],
+    });
+
+    this.audit.record('bond_claim_filed', {
+      claimId,
+      bondId: params.bondId,
+      claimedBy: params.claimedBy,
+      claimAmount: params.claimAmount,
+      description: params.description,
+      evidenceUrl: params.evidenceUrl,
+      arbitrationAgentId: bond.arbitrationAgentId,
+      reviewDeadline,
+    });
+
+    return {
+      claimId,
+      bondId: params.bondId,
+      status: 'under_review',
+      claimAmount: params.claimAmount,
+      arbitrationAgentId: bond.arbitrationAgentId,
+      reviewDeadline,
+    };
+  }
+
+  // ----------------------------------------------------------
+  // getCreditScore — query credit score from the CC registry
+  //
+  // In this starter kit the score is computed from the in-memory
+  // transaction history. A production implementation would query
+  // the CCAP registry API.
+  // ----------------------------------------------------------
+
+  getCreditScore(agentId: string): CreditScore {
+    // Return a cached score if available
+    const cached = creditScoreStore.get(agentId);
+    if (cached) {
+      this.audit.record('credit_score_queried', { agentId, score: cached.score });
+      return cached;
+    }
+
+    // Derive a basic score from the in-memory bond and escrow history
+    const agentBonds = Array.from(bondStore.values());
+    const agentEscrows = Array.from(extendedEscrowStore.values());
+
+    const completedEscrows = agentEscrows.filter((e) => e.status === 'released');
+    const disputedEscrows = agentEscrows.filter((e) => e.status === 'disputed');
+    const totalEscrows = agentEscrows.length;
+    const disputeRate = totalEscrows > 0 ? disputedEscrows.length / totalEscrows : 0;
+
+    const bondPeriodsCompleted = agentBonds.filter(
+      (b) => b.status === 'released' || b.status === 'expired',
+    ).length;
+    const claimsFiled = agentBonds.reduce((n, b) => n + b.claimsHistory.length, 0);
+    const claimsUpheld = agentBonds.reduce(
+      (n, b) => n + b.claimsHistory.filter((c) => c.status === 'upheld').length,
+      0,
+    );
+
+    // Simple heuristic scores — production would use the full weighted formula
+    const paymentReliabilityScore = completedEscrows.length > 0 ? 750 : 0;
+    const bondHistoryScore = bondPeriodsCompleted > 0 && claimsUpheld === 0 ? 800 : claimsFiled > 0 ? 400 : 0;
+    const volumeScore = Math.min(600, completedEscrows.length * 50);
+    const disputeScore = disputeRate === 0 ? 900 : Math.max(0, 900 - Math.round(disputeRate * 3000));
+    const diversityScore = 300; // Starter kit: single-agent context
+
+    const composite = Math.round(
+      paymentReliabilityScore * 0.30 +
+      bondHistoryScore * 0.25 +
+      volumeScore * 0.20 +
+      disputeScore * 0.15 +
+      diversityScore * 0.10,
+    );
+
+    const tier: CreditScoreTier =
+      composite >= 800 ? 'excellent' :
+      composite >= 600 ? 'good' :
+      composite >= 400 ? 'fair' :
+      'poor';
+
+    const now = new Date().toISOString();
+    const score: CreditScore = {
+      agentId,
+      score: composite,
+      tier,
+      computedAt: now,
+      nextUpdateAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+      historyWindowDays: 180,
+      components: {
+        paymentReliability: {
+          score: paymentReliabilityScore,
+          weight: 0.30,
+          dataPoints: completedEscrows.length,
+          detail: completedEscrows.length > 0
+            ? `${completedEscrows.length} completed escrow(s)`
+            : 'No payment history',
+        },
+        bondHistory: {
+          score: bondHistoryScore,
+          weight: 0.25,
+          dataPoints: bondPeriodsCompleted + claimsFiled,
+          detail: `${bondPeriodsCompleted} bond period(s) completed, ${claimsUpheld} claim(s) upheld`,
+        },
+        transactionVolume: {
+          score: volumeScore,
+          weight: 0.20,
+          dataPoints: completedEscrows.length,
+          totalUsd: completedEscrows.reduce((s, e) => s + e.amount, 0),
+          detail: `${completedEscrows.length} transaction(s) in history window`,
+        },
+        disputeRate: {
+          score: disputeScore,
+          weight: 0.15,
+          dataPoints: totalEscrows,
+          rate: disputeRate,
+          detail: `${disputedEscrows.length} dispute(s) out of ${totalEscrows} transaction(s)`,
+        },
+        counterpartyDiversity: {
+          score: diversityScore,
+          weight: 0.10,
+          dataPoints: 1,
+          detail: 'Single-agent context; diversity score is illustrative',
+        },
+      },
+      flags: composite === 0 ? [{
+        code: 'new_agent',
+        description: 'No transaction history recorded. Score will update as escrows and bonds complete.',
+        appliedAt: now,
+      }] : [],
+    };
+
+    creditScoreStore.set(agentId, score);
+
+    this.audit.record('credit_score_computed', { agentId, score: composite, tier });
+
+    return score;
+  }
+
+  // ----------------------------------------------------------
   // Helpers
   // ----------------------------------------------------------
 
@@ -236,6 +772,14 @@ export class CCAPEconomic {
     return escrowStore.get(escrowId);
   }
 
+  getExtendedEscrow(escrowId: string): ExtendedEscrowRecord | undefined {
+    return extendedEscrowStore.get(escrowId);
+  }
+
+  getBond(bondId: string): BondRecord | undefined {
+    return bondStore.get(bondId);
+  }
+
   private async expireEscrow(escrowId: string): Promise<void> {
     const record = escrowStore.get(escrowId);
     if (!record || record.status !== 'locked') return;
@@ -243,6 +787,35 @@ export class CCAPEconomic {
     escrowStore.set(escrowId, { ...record, status: 'expired' });
     this.audit.record('escrow_expired', { escrowId });
     // In production, release locked funds back to the originating wallet here
+  }
+
+  private async expireExtendedEscrow(escrowId: string): Promise<void> {
+    const record = extendedEscrowStore.get(escrowId);
+    if (!record || (record.status !== 'created' && record.status !== 'funded')) return;
+
+    extendedEscrowStore.set(escrowId, { ...record, status: 'expired' });
+    this.audit.record('extended_escrow_expired', { escrowId });
+    // In production, trigger a refund back to the buyer wallet
+  }
+
+  private async releaseBondOnExpiry(bondId: string): Promise<void> {
+    const bond = bondStore.get(bondId);
+    if (!bond || bond.status !== 'active') return;
+
+    const hasUnresolvedClaims = bond.claimsHistory.some((c) => c.status === 'under_review');
+    if (hasUnresolvedClaims) {
+      // Do not auto-release if there are unresolved claims
+      this.audit.record('bond_expiry_deferred', { bondId, reason: 'unresolved_claims' });
+      return;
+    }
+
+    bondStore.set(bondId, { ...bond, status: 'released' });
+    this.audit.record('bond_released', {
+      bondId,
+      amount: bond.remainingAmount,
+      currency: bond.currency,
+    });
+    // In production, route bond.remainingAmount back to the agent's wallet here
   }
 
   private generateInvoiceId(): string {

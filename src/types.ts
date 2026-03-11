@@ -141,6 +141,241 @@ export interface EscrowRecord extends EscrowResult {
 }
 
 // ------------------------------------------------------------
+// Escrow (extended: create / verify / release / refund)
+// ------------------------------------------------------------
+
+export type DisputeResolutionMethod = 'arbitration_agent' | 'multi_sig' | 'automatic';
+
+export interface CreateEscrowParams {
+  amount: number;
+  currency: string;
+  beneficiaryAgentId: string;
+  completionCriteria: string;
+  timeoutSeconds: number;
+  disputeResolutionMethod: DisputeResolutionMethod;
+  arbitrationAgentId?: string;
+  idempotencyKey?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface CreateEscrowResult {
+  escrowId: string;
+  status: 'created';
+  amount: number;
+  currency: string;
+  beneficiaryAgentId: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export type EscrowStatusValue = 'created' | 'funded' | 'released' | 'refunded' | 'expired' | 'disputed';
+
+export interface EscrowStatusResult {
+  escrowId: string;
+  status: EscrowStatusValue;
+  amount: number;
+  currency: string;
+  buyerAgentId?: string;
+  beneficiaryAgentId: string;
+  completionCriteria: string;
+  expiresAt: string;
+  disputeResolutionMethod: DisputeResolutionMethod;
+  verifiedAt: string;
+}
+
+export interface ReleaseEscrowResult {
+  escrowId: string;
+  status: 'released';
+  amount: number;
+  currency: string;
+  releasedTo: string;
+  releasedAt: string;
+  transactionId: string;
+}
+
+export interface RefundEscrowResult {
+  escrowId: string;
+  status: 'refunded';
+  amount: number;
+  currency: string;
+  refundedTo: string;
+  refundedAt: string;
+  transactionId: string;
+}
+
+// Internal extended escrow record
+export interface ExtendedEscrowRecord {
+  escrowId: string;
+  status: EscrowStatusValue;
+  amount: number;
+  currency: string;
+  buyerAgentId: string;
+  beneficiaryAgentId: string;
+  completionCriteria: string;
+  disputeResolutionMethod: DisputeResolutionMethod;
+  arbitrationAgentId?: string;
+  createdAt: string;
+  expiresAt: string;
+  fundedAt?: string;
+  releasedAt?: string;
+  refundedAt?: string;
+  completionEvidence?: string;
+  idempotencyKey?: string;
+}
+
+// ------------------------------------------------------------
+// Liability Bond
+// ------------------------------------------------------------
+
+export type BondScope =
+  | 'legal_document_handling'
+  | 'financial_transaction_routing'
+  | 'email_processing'
+  | 'code_generation'
+  | 'code_deployment'
+  | 'general_purpose';
+
+export type BondStatusValue = 'active' | 'expired' | 'fully_claimed' | 'released';
+
+export interface PostBondParams {
+  amount: number;
+  currency: string;
+  scope: BondScope;
+  scopeDescription: string;
+  durationSeconds: number;
+  claimConditions: string;
+  maxClaimAmount: number;
+  arbitrationAgentId: string;
+  humanEscalationThresholdUsd?: number;
+  idempotencyKey?: string;
+}
+
+export interface BondResult {
+  bondId: string;
+  status: BondStatusValue;
+  amount: number;
+  currency: string;
+  scope: BondScope;
+  agentId: string;
+  activeFrom: string;
+  expiresAt: string;
+  transactionId: string;
+}
+
+export interface BondRecord {
+  bondId: string;
+  status: BondStatusValue;
+  agentId: string;
+  amount: number;
+  remainingAmount: number;
+  currency: string;
+  scope: BondScope;
+  scopeDescription: string;
+  claimConditions: string;
+  maxClaimAmount: number;
+  arbitrationAgentId: string;
+  humanEscalationThresholdUsd: number;
+  activeFrom: string;
+  expiresAt: string;
+  claimsHistory: ClaimRecord[];
+  idempotencyKey?: string;
+}
+
+export interface VerifyBondResult {
+  agentId: string;
+  hasActiveBond: boolean;
+  bondId?: string;
+  amount?: number;
+  currency?: string;
+  scope?: BondScope;
+  expiresAt?: string;
+  claimsHistory?: {
+    totalPeriods: number;
+    claimsFiled: number;
+    claimsUpheld: number;
+  };
+}
+
+export interface ClaimBondParams {
+  bondId: string;
+  claimedBy: string;
+  claimAmount: number;
+  description: string;
+  evidenceUrl?: string;
+  idempotencyKey?: string;
+}
+
+export interface ClaimRecord {
+  claimId: string;
+  bondId: string;
+  claimedBy: string;
+  claimAmount: number;
+  description: string;
+  evidenceUrl?: string;
+  status: 'under_review' | 'upheld' | 'rejected';
+  filedAt: string;
+  resolvedAt?: string;
+}
+
+export interface ClaimBondResult {
+  claimId: string;
+  bondId: string;
+  status: 'under_review';
+  claimAmount: number;
+  arbitrationAgentId: string;
+  reviewDeadline: string;
+}
+
+// ------------------------------------------------------------
+// Credit Score
+// ------------------------------------------------------------
+
+export type CreditScoreTier = 'excellent' | 'good' | 'fair' | 'poor';
+
+export interface ScoreComponent {
+  score: number;
+  weight: number;
+  dataPoints: number;
+  detail: string;
+}
+
+export interface TransactionVolumeComponent extends ScoreComponent {
+  totalUsd: number;
+}
+
+export interface DisputeRateComponent extends ScoreComponent {
+  rate: number;
+}
+
+export interface CreditScore {
+  agentId: string;
+  score: number;
+  tier: CreditScoreTier;
+  computedAt: string;
+  nextUpdateAt: string;
+  historyWindowDays: number;
+  components: {
+    paymentReliability: ScoreComponent;
+    bondHistory: ScoreComponent;
+    transactionVolume: TransactionVolumeComponent;
+    disputeRate: DisputeRateComponent;
+    counterpartyDiversity: ScoreComponent;
+  };
+  flags: CreditScoreFlag[];
+}
+
+export interface CreditScoreFlag {
+  code:
+    | 'self_dealing_detected'
+    | 'volume_velocity_spike'
+    | 'claim_under_review'
+    | 'insufficient_history'
+    | 'new_agent';
+  description: string;
+  appliedAt: string;
+}
+
+// ------------------------------------------------------------
 // CCAP Composition
 // ------------------------------------------------------------
 

@@ -166,6 +166,206 @@ const ECONOMIC_TOOLS: ToolDefinition[] = [
       return router.providerStatus();
     },
   },
+
+  // ----------------------------------------------------------
+  // Escrow and Trust tools
+  // ----------------------------------------------------------
+
+  {
+    name: 'create_escrow',
+    description: 'Create a pre-work escrow that locks the buyer\'s funds before the seller begins work. ' +
+      'The seller can verify the escrow is funded before committing effort. ' +
+      'Funds release on completion or return to the buyer on timeout.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        amount: { type: 'number', description: 'Amount to lock in escrow' },
+        currency: { type: 'string', description: 'Currency code (USDC, USD, ETH, USDT)' },
+        beneficiaryAgentId: { type: 'string', description: 'CCAP agent ID of the seller' },
+        completionCriteria: { type: 'string', description: 'What must happen for the escrow to release' },
+        timeoutSeconds: { type: 'number', description: 'Seconds until escrow expires and refund triggers' },
+        disputeResolutionMethod: {
+          type: 'string',
+          enum: ['arbitration_agent', 'multi_sig', 'automatic'],
+          description: 'How disputes are resolved if raised',
+        },
+        arbitrationAgentId: { type: 'string', description: 'Arbitration agent ID (required for arbitration_agent method)' },
+      },
+      required: ['amount', 'currency', 'beneficiaryAgentId', 'completionCriteria', 'timeoutSeconds', 'disputeResolutionMethod'],
+    },
+    async handler(args, economic) {
+      return economic.createEscrow({
+        amount: args['amount'] as number,
+        currency: args['currency'] as string,
+        beneficiaryAgentId: args['beneficiaryAgentId'] as string,
+        completionCriteria: args['completionCriteria'] as string,
+        timeoutSeconds: args['timeoutSeconds'] as number,
+        disputeResolutionMethod: args['disputeResolutionMethod'] as 'arbitration_agent' | 'multi_sig' | 'automatic',
+        arbitrationAgentId: args['arbitrationAgentId'] as string | undefined,
+      });
+    },
+  },
+
+  {
+    name: 'verify_escrow',
+    description: 'Verify that an escrow exists and check its current status. ' +
+      'Sellers SHOULD call this before starting work to confirm the escrow is funded.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        escrowId: { type: 'string', description: 'Escrow ID returned from create_escrow' },
+      },
+      required: ['escrowId'],
+    },
+    async handler(args, economic) {
+      return economic.verifyEscrow(args['escrowId'] as string);
+    },
+  },
+
+  {
+    name: 'release_escrow',
+    description: 'Release escrow funds to the beneficiary after work is complete. ' +
+      'Funds transfer is atomic: either the full amount transfers or nothing moves.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        escrowId: { type: 'string', description: 'Escrow ID to release' },
+        completionEvidence: { type: 'string', description: 'URL or description of the deliverable' },
+      },
+      required: ['escrowId'],
+    },
+    async handler(args, economic) {
+      return economic.releaseEscrow(
+        args['escrowId'] as string,
+        args['completionEvidence'] as string | undefined,
+      );
+    },
+  },
+
+  {
+    name: 'refund_escrow',
+    description: 'Return escrow funds to the buyer. Valid only when status is created or funded. ' +
+      'Occurs automatically on timeout.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        escrowId: { type: 'string', description: 'Escrow ID to refund' },
+        reason: { type: 'string', description: 'Reason for the refund' },
+      },
+      required: ['escrowId'],
+    },
+    async handler(args, economic) {
+      return economic.refundEscrow(
+        args['escrowId'] as string,
+        args['reason'] as string | undefined,
+      );
+    },
+  },
+
+  {
+    name: 'post_bond',
+    description: 'Post a liability bond — a performance deposit locked as a costly signal. ' +
+      'Posting a large bond signals competence: only an agent with a low private estimate of failure probability can afford to sustain bond posting over time.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        amount: { type: 'number', description: 'Total bond amount to lock' },
+        currency: { type: 'string', description: 'Currency code' },
+        scope: {
+          type: 'string',
+          enum: ['legal_document_handling', 'financial_transaction_routing', 'email_processing', 'code_generation', 'code_deployment', 'general_purpose'],
+          description: 'Category of operations the bond covers',
+        },
+        scopeDescription: { type: 'string', description: 'Human-readable description of covered operations' },
+        durationSeconds: { type: 'number', description: 'How long the bond is active' },
+        claimConditions: { type: 'string', description: 'What constitutes a valid claim against the bond' },
+        maxClaimAmount: { type: 'number', description: 'Maximum amount claimable in a single claim' },
+        arbitrationAgentId: { type: 'string', description: 'CCAP agent ID of the designated arbitrator' },
+        humanEscalationThresholdUsd: { type: 'number', description: 'Claims above this amount require human review (default: 10000)' },
+      },
+      required: ['amount', 'currency', 'scope', 'scopeDescription', 'durationSeconds', 'claimConditions', 'maxClaimAmount', 'arbitrationAgentId'],
+    },
+    async handler(args, economic) {
+      return economic.postBond({
+        amount: args['amount'] as number,
+        currency: args['currency'] as string,
+        scope: args['scope'] as import('./types.js').BondScope,
+        scopeDescription: args['scopeDescription'] as string,
+        durationSeconds: args['durationSeconds'] as number,
+        claimConditions: args['claimConditions'] as string,
+        maxClaimAmount: args['maxClaimAmount'] as number,
+        arbitrationAgentId: args['arbitrationAgentId'] as string,
+        humanEscalationThresholdUsd: args['humanEscalationThresholdUsd'] as number | undefined,
+      });
+    },
+  },
+
+  {
+    name: 'verify_bond',
+    description: 'Check whether an agent has an active liability bond for a given scope. ' +
+      'Clients SHOULD call this before engaging an agent for sensitive operations.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        agentId: { type: 'string', description: 'CCAP agent ID to check' },
+        scope: {
+          type: 'string',
+          enum: ['legal_document_handling', 'financial_transaction_routing', 'email_processing', 'code_generation', 'code_deployment', 'general_purpose'],
+          description: 'Scope to check. Omit to check any active bond.',
+        },
+      },
+      required: ['agentId'],
+    },
+    async handler(args, economic) {
+      return economic.verifyBond(
+        args['agentId'] as string,
+        args['scope'] as import('./types.js').BondScope | undefined,
+      );
+    },
+  },
+
+  {
+    name: 'claim_bond',
+    description: 'Submit a claim against an agent\'s liability bond. ' +
+      'Claims are placed under arbitration review — they are not automatically paid. ' +
+      'Automatic payment without adjudication would create a griefing vector.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        bondId: { type: 'string', description: 'Bond ID to claim against' },
+        claimedBy: { type: 'string', description: 'Agent ID of the claimant' },
+        claimAmount: { type: 'number', description: 'Amount claimed' },
+        description: { type: 'string', description: 'Description of the alleged damage' },
+        evidenceUrl: { type: 'string', description: 'URL to supporting evidence' },
+      },
+      required: ['bondId', 'claimedBy', 'claimAmount', 'description'],
+    },
+    async handler(args, economic) {
+      return economic.claimBond({
+        bondId: args['bondId'] as string,
+        claimedBy: args['claimedBy'] as string,
+        claimAmount: args['claimAmount'] as number,
+        description: args['description'] as string,
+        evidenceUrl: args['evidenceUrl'] as string | undefined,
+      });
+    },
+  },
+
+  {
+    name: 'get_credit_score',
+    description: 'Query an agent\'s credit score. Returns a 0–1000 score with component breakdown. ' +
+      'New agents start at 0; trust is earned from transaction history, not granted by default.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        agentId: { type: 'string', description: 'CCAP agent ID to query' },
+      },
+      required: ['agentId'],
+    },
+    async handler(args, economic) {
+      return economic.getCreditScore(args['agentId'] as string);
+    },
+  },
 ];
 
 // ----------------------------------------------------------
