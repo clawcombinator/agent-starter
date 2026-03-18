@@ -27,6 +27,9 @@ import type { SafetyMonitor } from './safety.js';
 import type { AuditLogger } from './audit.js';
 import type { CCAPEconomic } from './ccap/economic.js';
 import type { PaymentRouter } from './router.js';
+import {
+  OperatorIntakeEngine,
+} from './operator-intake.js';
 import { settlementStatusAllowed, validateStructuredDeliverable } from './output-contracts.js';
 import { getVerificationPolicy } from './verification-policy.js';
 import winston from 'winston';
@@ -93,6 +96,7 @@ export class AgentMCPServer {
   private readonly agentRegistry = new Map<string, RegisteredAgentEntry>();
   private readonly escrowVerificationRequirements = new Map<string, EscrowVerificationRequirement>();
   private readonly escrowVerificationResults = new Map<string, ContractVerifyResult>();
+  private readonly operatorIntake: OperatorIntakeEngine;
 
   constructor(
     private readonly safety: SafetyMonitor,
@@ -109,6 +113,8 @@ export class AgentMCPServer {
         capabilities: { tools: {} },
       },
     );
+
+    this.operatorIntake = new OperatorIntakeEngine(this.audit);
 
     this.tools = this.buildTools();
     for (const tool of this.tools) {
@@ -619,6 +625,93 @@ export class AgentMCPServer {
           additionalProperties: false,
         },
         handler: async (args) => this.readWorldSpec(args['spec_version']),
+      },
+      {
+        name: 'operator_capability_map',
+        description:
+          'Return the first-party OpenClaw operator envelope, authority boundaries, and recommended routing surfaces.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            spec_version: { type: 'string', description: 'Requested world-spec version' },
+          },
+          additionalProperties: false,
+        },
+        handler: async (args) => {
+          if (args['spec_version'] !== undefined) {
+            this.assertSupportedSpecVersion(args['spec_version']);
+          }
+          return this.operatorIntake.getCapabilityMap();
+        },
+      },
+      {
+        name: 'operator_intake_record',
+        description:
+          'Normalize and triage first-party inbound traffic into a replayable intake record. State-changing calls require a nonce.',
+        mutatesState: true,
+        inputSchema: {
+          type: 'object',
+          required: ['channel', 'sender_id', 'text', 'nonce', 'spec_version'],
+          properties: {
+            channel: {
+              type: 'string',
+              enum: ['email', 'form', 'api', 'mcp', 'a2a', 'webhook', 'telegram', 'discord', 'slack', 'whatsapp'],
+            },
+            sender_id: { type: 'string' },
+            sender_type: {
+              type: 'string',
+              enum: ['agent', 'human', 'unknown'],
+            },
+            sender_display: { type: 'string' },
+            subject: { type: 'string' },
+            text: { type: 'string' },
+            message_id: { type: 'string' },
+            thread_id: { type: 'string' },
+            requested_capabilities: {
+              type: 'array',
+              items: { type: 'string' },
+            },
+            attachments: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string' },
+                  media_type: { type: 'string' },
+                  size_bytes: { type: 'integer', minimum: 0 },
+                  evidence_ref: { type: 'string' },
+                },
+                required: ['name', 'media_type'],
+                additionalProperties: false,
+              },
+            },
+            metadata: {
+              type: 'object',
+              description: 'Opaque metadata carried through the intake envelope',
+            },
+            received_at: { type: 'string', description: 'Optional ISO 8601 timestamp override' },
+            nonce: { type: 'string' },
+            spec_version: { type: 'string' },
+          },
+          additionalProperties: false,
+        },
+        handler: async (args) => {
+          this.assertSupportedSpecVersion(args['spec_version']);
+          return this.operatorIntake.recordInbound({
+            channel: args['channel'] as import('./operator-intake.js').InboundChannel,
+            sender_id: args['sender_id'] as string,
+            sender_type: args['sender_type'] as import('./operator-intake.js').InboundSenderType | undefined,
+            sender_display: args['sender_display'] as string | undefined,
+            subject: args['subject'] as string | undefined,
+            text: args['text'] as string,
+            message_id: args['message_id'] as string | undefined,
+            thread_id: args['thread_id'] as string | undefined,
+            requested_capabilities: args['requested_capabilities'] as string[] | undefined,
+            attachments: args['attachments'] as import('./operator-intake.js').IntakeAttachment[] | undefined,
+            metadata: args['metadata'] as Record<string, unknown> | undefined,
+            received_at: args['received_at'] as string | undefined,
+          });
+        },
       },
       {
         name: 'agent_register',

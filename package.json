@@ -17,7 +17,8 @@
     "lint": "tsc --noEmit",
     "demo": "tsx demo/run-demo.ts",
     "demo:marketplace": "tsx demo/run-marketplace.ts",
-    "demo:reference": "tsx demo/run-reference-workflow.ts"
+    "demo:reference": "tsx demo/run-reference-workflow.ts",
+    "demo:operator-intake": "tsx demo/run-operator-intake.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",

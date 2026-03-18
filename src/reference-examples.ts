@@ -2,6 +2,12 @@ import type {
   AgentCardDocument,
   OutputContractDocument,
 } from './types.js';
+import {
+  FIRST_PARTY_OPERATOR_CANONICAL_INBOX,
+  FIRST_PARTY_OPERATOR_OUTPUT_CONTRACT_ID,
+  FIRST_PARTY_OPERATOR_TRIAGE_DELIVERABLE_SCHEMA,
+  FIRST_PARTY_OPERATOR_WORKFLOW_CLASS,
+} from './operator-intake.js';
 
 export const LEGAL_DUE_DILIGENCE_AGENT_CARD: AgentCardDocument = {
   agent_id: 'lex_duediligence_v2',
@@ -146,4 +152,71 @@ export const PROJECT_BIRCH_PRODUCT_SPEC = {
   requested_capability: FINANCIAL_SCENARIO_AGENT_CARD.contract.name,
   artefact_type: 'productSpec',
   required_output_contract: PROJECT_BIRCH_FINANCIAL_ANALYSIS_CONTRACT.contract_id,
+} as const;
+
+export const CLAWCOMBINATOR_RELAY_OPERATOR_AGENT_CARD: AgentCardDocument = {
+  agent_id: 'clawcombinator_relay_operator_v1',
+  capability: 'agentDiscovery',
+  spec_version: '0.1.0',
+  reputation_score: 730,
+  bond_capacity_usd_cents: 0,
+  supports_mcp: true,
+  supports_a2a: true,
+  contract: {
+    name: 'clawcombinator_inbound_triage',
+    input_type: 'intent',
+    output_type: 'structuredDeliverable',
+    required_tier: 'replayableTest',
+    mutates_state: false,
+    idempotent_by_nonce: true,
+    escrow_required: false,
+    spec_version: '0.1.0',
+  },
+};
+
+export const CLAWCOMBINATOR_INBOUND_TRIAGE_CONTRACT: OutputContractDocument = {
+  contract_id: FIRST_PARTY_OPERATOR_OUTPUT_CONTRACT_ID,
+  name: 'clawcombinator_inbound_triage',
+  spec_version: '0.1.0',
+  workflow_class: FIRST_PARTY_OPERATOR_WORKFLOW_CLASS,
+  input_type: 'intent',
+  output_type: 'structuredDeliverable',
+  verification_tier: 'replayableTest',
+  deliverable_schema: FIRST_PARTY_OPERATOR_TRIAGE_DELIVERABLE_SCHEMA,
+  settlement_rules: {
+    requires_funded_escrow: false,
+    required_verification_statuses: ['validated'],
+  },
+  example_subject_ref: 'intake:sample:email',
+};
+
+export const CLAWCOMBINATOR_SAMPLE_INBOUND_TRIAGE_DELIVERABLE = {
+  intake_id: 'inbound_29c84d84afc5a4c1',
+  canonical_inbox: FIRST_PARTY_OPERATOR_CANONICAL_INBOX,
+  public_aliases: ['claw@clawcombinator.ai'],
+  channel: 'email',
+  sender_type: 'agent',
+  sender_ref: 'sha256:5164a4feac4251009be27eb88641b8d4f91f16e30c3c387d74fef7f26a555d21',
+  message_ref: 'msg_demo_001',
+  summary:
+    'Subject: Need ClawCombinator discovery docs - Please send llms.txt, agents.md, and the Agent Card schema for MCP and A2A integration.',
+  requested_capabilities: ['discovery_guidance'],
+  matched_capability_rules: ['docs_and_discovery_guidance'],
+  risk_level: 'low',
+  route: 'auto_reply',
+  status: 'accepted',
+  authority: 'bounded_auto',
+  required_verification_tier: 'replayableTest',
+  workflow_class: FIRST_PARTY_OPERATOR_WORKFLOW_CLASS,
+  output_contract_id: FIRST_PARTY_OPERATOR_OUTPUT_CONTRACT_ID,
+  governance_refs: ['KILLSWITCH.md', 'THROTTLE.md', 'ESCALATE.md', 'FAILURE.md'],
+  reason_codes: ['agent_sender', 'discovery_request'],
+  next_actions: [
+    'Reply with the world spec, agents.md, and the relevant machine-readable examples.',
+    'State clearly which surfaces are live versus draft-public.',
+  ],
+  evidence_ref: 'sha256:29c84d84afc5a4c1aa345b68ff0efaf9d3e4aa4664efc3c4bc6d3d6b4e5461f5',
+  received_at: '2026-03-18T17:45:00Z',
+  duplicate: false,
+  duplicate_count: 0,
 } as const;

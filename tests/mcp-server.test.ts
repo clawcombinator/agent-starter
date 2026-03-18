@@ -21,6 +21,9 @@ import { PaymentRouter } from '../src/router.js';
 import { CCAPEconomic } from '../src/ccap/economic.js';
 import { AgentMCPServer } from '../src/mcp-server.js';
 import {
+  CLAWCOMBINATOR_INBOUND_TRIAGE_CONTRACT,
+  CLAWCOMBINATOR_RELAY_OPERATOR_AGENT_CARD,
+  CLAWCOMBINATOR_SAMPLE_INBOUND_TRIAGE_DELIVERABLE,
   FINANCIAL_SCENARIO_AGENT_CARD,
   LEGAL_DUE_DILIGENCE_AGENT_CARD,
   PROJECT_BIRCH_FINANCIAL_ANALYSIS_CONTRACT,
@@ -134,6 +137,61 @@ describe('AgentMCPServer reference-stack tools', () => {
     expect(
       ((result.results[0]!['compatibility'] as Record<string, unknown>)['matched_fields'] as string[]),
     ).toContain('capability');
+  });
+
+  it('operator_capability_map returns the first-party relay inbox and OpenClaw plan', async () => {
+    const { mcp } = makeServer();
+
+    const result = await mcp.executeTool('operator_capability_map', {
+      spec_version: '0.1.0',
+    }) as Record<string, unknown>;
+
+    expect(result['canonical_inbox']).toBe('relay@clawcombinator.ai');
+    expect(result['public_aliases']).toEqual(['claw@clawcombinator.ai']);
+
+    const recommended = result['recommended_openclaw'] as Record<string, unknown>;
+    expect(recommended['dm_policy']).toBe('pairing');
+    expect(recommended['hook_session_key_template']).toBe('hook:gmail:{{messages[0].id}}');
+  });
+
+  it('operator_intake_record emits a replayable deliverable that contract_verify accepts', async () => {
+    const { mcp } = makeServer();
+
+    await mcp.executeTool('agent_register', {
+      agent_card: CLAWCOMBINATOR_RELAY_OPERATOR_AGENT_CARD,
+      signature: 'sig_relay_operator',
+      nonce: 'register-relay-operator',
+      spec_version: '0.1.0',
+    });
+
+    const triaged = await mcp.executeTool('operator_intake_record', {
+      channel: 'email',
+      sender_id: 'agent@example.ai',
+      sender_type: 'agent',
+      subject: 'Need ClawCombinator discovery docs',
+      text: 'Please send llms.txt, agents.md, and the Agent Card schema for MCP and A2A integration.',
+      message_id: 'msg_operator_001',
+      nonce: 'operator-intake-001',
+      spec_version: '0.1.0',
+    }) as Record<string, unknown>;
+
+    expect(triaged['route']).toBe('auto_reply');
+    expect(triaged['risk_level']).toBe('low');
+    expect(triaged['output_contract_id']).toBe(CLAWCOMBINATOR_INBOUND_TRIAGE_CONTRACT.contract_id);
+
+    const verified = await mcp.executeTool('contract_verify', {
+      contract_name: CLAWCOMBINATOR_INBOUND_TRIAGE_CONTRACT.name,
+      subject_type: 'structuredDeliverable',
+      subject_ref: `intake:${triaged['intake_id'] as string}`,
+      verification_tier: 'replayableTest',
+      output_contract_ref: CLAWCOMBINATOR_INBOUND_TRIAGE_CONTRACT.contract_id,
+      output_contract: CLAWCOMBINATOR_INBOUND_TRIAGE_CONTRACT,
+      subject_payload: triaged,
+      spec_version: '0.1.0',
+    }) as Record<string, unknown>;
+
+    expect(verified['status']).toBe('validated');
+    expect(verified['evidence_ref']).toMatch(/^sha256:/);
   });
 
   it('escrow_lock creates a funded escrow and replays safely for the same nonce', async () => {
@@ -259,6 +317,23 @@ describe('AgentMCPServer reference-stack tools', () => {
     expect(verified['evidence_ref']).toMatch(/^sha256:/);
     expect(released['status']).toBe('released');
     expect(economic.getExtendedEscrow(locked['escrow_id'] as string)?.status).toBe('released');
+  });
+
+  it('operator intake example remains valid against the canonical intake output contract', async () => {
+    const { mcp } = makeServer();
+
+    const verified = await mcp.executeTool('contract_verify', {
+      contract_name: CLAWCOMBINATOR_INBOUND_TRIAGE_CONTRACT.name,
+      subject_type: 'structuredDeliverable',
+      subject_ref: 'intake:sample:email',
+      verification_tier: 'replayableTest',
+      output_contract_ref: CLAWCOMBINATOR_INBOUND_TRIAGE_CONTRACT.contract_id,
+      output_contract: CLAWCOMBINATOR_INBOUND_TRIAGE_CONTRACT,
+      subject_payload: CLAWCOMBINATOR_SAMPLE_INBOUND_TRIAGE_DELIVERABLE,
+      spec_version: '0.1.0',
+    }) as Record<string, unknown>;
+
+    expect(verified['status']).toBe('validated');
   });
 
   it('contract_verify rejects invalid structured deliverables and keeps escrow locked', async () => {

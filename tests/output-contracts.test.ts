@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  CLAWCOMBINATOR_INBOUND_TRIAGE_CONTRACT,
+  CLAWCOMBINATOR_SAMPLE_INBOUND_TRIAGE_DELIVERABLE,
   PROJECT_BIRCH_FINANCIAL_ANALYSIS_CONTRACT,
   PROJECT_BIRCH_FINANCIAL_ANALYSIS_DELIVERABLE,
 } from '../src/reference-examples.js';
@@ -51,5 +53,16 @@ describe('output-contract validation', () => {
         'rejected',
       ),
     ).toBe(false);
+  });
+
+  it('validates the first-party operator intake deliverable against the canonical intake contract', () => {
+    const result = validateStructuredDeliverable(
+      CLAWCOMBINATOR_INBOUND_TRIAGE_CONTRACT,
+      CLAWCOMBINATOR_SAMPLE_INBOUND_TRIAGE_DELIVERABLE,
+    );
+
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+    expect(result.evidenceRef).toMatch(/^sha256:/);
   });
 });

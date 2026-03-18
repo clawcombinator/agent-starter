@@ -37,6 +37,13 @@ export const VERIFICATION_POLICY: VerificationPolicyEntry[] = [
     settlement_mode: 'manual',
     rationale: 'Dispute handling should rely on bounded consensus from independent reviewers rather than a single automated judge.',
   },
+  {
+    workflow_class: 'first_party_operator_intake',
+    required_tier: 'replayableTest',
+    passing_status: 'validated',
+    settlement_mode: 'manual',
+    rationale: 'Inbound triage should be replayable and auditable, but any external commitment or privileged action still requires human review.',
+  },
 ];
 
 export function getVerificationPolicy(
