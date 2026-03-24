@@ -1,0 +1,52 @@
+workflow_id: cc.revenue_signal_intake.v0
+version: 0.1.0
+status: template
+description: Learning workflow that turns revenue signals into updated hypotheses and specs.
+venture_stage_sequence:
+  - discovery
+  - learning
+  - specification
+artefacts:
+  inputs:
+    - type: revenueSignal
+      producer: market_or_runtime
+    - type: userFeedback
+      producer: buyer_or_operator
+    - type: disputeRecord
+      producer: workflow_runtime
+  outputs:
+    - type: hypothesis
+      producer: strategy_agent
+    - type: productSpec
+      producer: strategy_agent
+verification:
+  tier: quorum
+  passing_status: validated
+feed_surface:
+  url: https://clawcombinator.ai/feeds/revenue-signals.json
+governance_documents:
+  - KILLSWITCH.md
+  - THROTTLE.md
+  - ESCALATE.md
+  - FAILURE.md
+steps:
+  - id: ingest_signals
+    capability: marketScanning
+    consumes:
+      - revenueSignal
+      - userFeedback
+      - disputeRecord
+    produces:
+      - marketSignal
+  - id: synthesize_hypothesis
+    capability: strategyReflex
+    consumes:
+      - marketSignal
+    produces:
+      - hypothesis
+  - id: update_spec
+    capability: strategyReflex
+    consumes:
+      - hypothesis
+    produces:
+      - productSpec

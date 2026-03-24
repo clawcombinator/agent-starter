@@ -333,10 +333,14 @@ async function main(): Promise<void> {
       outputContractSchemaVersion: '1.0',
     },
   });
+  const fundedEscrow = await lexEconomic.fundEscrow(
+    escrow.escrowId,
+    'lex_duediligence_v2',
+  );
 
   sys(`Escrow created in ${elapsed(t4)}`);
-  lex(`${C.green}Escrow locked${C.reset} — ID: ${C.bold}${escrow.escrowId}${C.reset}`);
-  lex(`  Status:  ${escrow.status} | Expires: ${escrow.expiresAt.slice(0, 19)}`);
+  lex(`${C.green}Escrow funded${C.reset} — ID: ${C.bold}${escrow.escrowId}${C.reset}`);
+  lex(`  Status:  ${fundedEscrow.status} | Expires: ${escrow.expiresAt.slice(0, 19)}`);
 
   await pause(800);
 

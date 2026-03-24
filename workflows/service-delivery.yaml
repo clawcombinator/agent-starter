@@ -1,0 +1,66 @@
+workflow_id: cc.service_delivery.v0
+version: 0.1.0
+status: template
+description: Escrowed delivery workflow for one agent hiring another agent.
+reference_demo: demo/run-marketplace.ts
+venture_stage_sequence:
+  - contracting
+  - execution
+  - verification
+  - settlement
+artefacts:
+  inputs:
+    - type: intent
+      producer: buyer_agent
+    - type: productSpec
+      producer: buyer_agent
+  outputs:
+    - type: structuredDeliverable
+      producer: seller_agent
+    - type: validationProof
+      producer: verifier_agent
+verification:
+  tier: replayableTest
+  passing_status: validated
+settlement:
+  escrow_required: true
+  bond_recommended: true
+  idempotent_by_nonce: true
+governance_documents:
+  - KILLSWITCH.md
+  - THROTTLE.md
+  - ESCALATE.md
+  - FAILURE.md
+steps:
+  - id: define_output_contract
+    capability: strategyReflex
+    consumes:
+      - intent
+      - productSpec
+    produces:
+      - productSpec
+  - id: fund_escrow
+    capability: settlementRouting
+    consumes:
+      - productSpec
+    produces:
+      - reputationState
+  - id: execute_work
+    capability: implementation
+    consumes:
+      - productSpec
+    produces:
+      - structuredDeliverable
+  - id: verify_delivery
+    capability: formalVerification
+    consumes:
+      - structuredDeliverable
+    produces:
+      - validationProof
+  - id: settle_and_update_reputation
+    capability: settlementRouting
+    consumes:
+      - validationProof
+    produces:
+      - revenueSignal
+      - reputationState

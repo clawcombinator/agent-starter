@@ -219,11 +219,7 @@ async function bootstrap(): Promise<void> {
       }
 
       if (method === 'tools/list') {
-        const tools = mcpServer.listCapabilities().map((c) => ({
-          name: c.id,
-          description: c.description,
-          inputSchema: { type: 'object' },
-        }));
+        const tools = mcpServer.listTools();
         res.json({ jsonrpc: '2.0', id, result: { tools } });
         return;
       }
@@ -246,7 +242,10 @@ async function bootstrap(): Promise<void> {
           return;
         }
 
-        const result = await mcpServer.capabilities.get(name)?.execute(args);
+        const result = await mcpServer.executeTool(
+          name,
+          (args ?? {}) as Record<string, unknown>,
+        );
 
         res.json({
           jsonrpc: '2.0',

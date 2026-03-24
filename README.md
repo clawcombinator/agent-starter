@@ -8,7 +8,7 @@ Wire your agent into the real payment ecosystem in minutes.
 
 This starter kit integrates your agent with three existing payment standards — **Coinbase AgentKit** (crypto), **Stripe** (card and bank transfer), and **x402** (HTTP-native micropayments) — behind a unified `PaymentRouter` that picks the best provider automatically. CC's two genuine contributions are:
 
-1. **PaymentRouter** — the "OpenRouter for agent payments". No existing provider solves multi-provider routing with automatic fallback and a consistent interface. This is the gap CC fills.
+1. **PaymentRouter** — the clearing house for agent payments. No existing provider solves multi-provider routing with automatic fallback and a consistent interface. This is the gap CC fills.
 2. **SafetyMonitor with hash-chained AuditLogger** — budget enforcement, kill switch, and a tamper-evident audit trail that sits above all providers as a governance layer. No payment SDK solves this.
 
 Everything else acknowledges the ecosystem: Coinbase, Stripe, and x402 are mature, independent standards. You only need to configure the ones you actually use.
@@ -131,6 +131,18 @@ agent-starter/
 ├── config/
 │   ├── capabilities.yaml         # Capability definitions and pricing
 │   └── safety.yaml               # Budget constraints, provider config
+├── governance/
+│   ├── KILLSWITCH.md             # Mandatory stop policy for reusable workflows
+│   ├── THROTTLE.md               # Mandatory slowdown and rate policy
+│   ├── ESCALATE.md               # Mandatory handoff and review policy
+│   └── FAILURE.md                # Mandatory failure and compensation policy
+├── workflows/
+│   ├── service-delivery.yaml     # Escrowed delivery template
+│   ├── programme-application.yaml# Agent-native application template
+│   └── revenue-signal-intake.yaml# Learning loop from market evidence
+├── contracts/
+│   └── Contracts/
+│       └── CategorySpec.lean     # Canonical world model mirrored to clawcombinator.ai
 ├── .env.example
 ├── package.json
 ├── tsconfig.json
@@ -139,9 +151,59 @@ agent-starter/
 
 ---
 
+## Governance Pack
+
+Reusable workflows in the ClawCombinator stack are expected to ship with four
+governance documents:
+
+- `governance/KILLSWITCH.md`
+- `governance/THROTTLE.md`
+- `governance/ESCALATE.md`
+- `governance/FAILURE.md`
+
+These files are templates, not finished policy. Replace the placeholder
+thresholds, endpoints, and operators before you rely on them in production.
+Run `npm run check:governance` to confirm the pack and workflow references are present.
+
+---
+
+## Workflow Templates
+
+The starter kit now includes machine-readable workflow templates aligned to the
+public semantic kernel:
+
+- `workflows/service-delivery.yaml`
+- `workflows/programme-application.yaml`
+- `workflows/revenue-signal-intake.yaml`
+
+Treat these as structured starting points for orchestration. The artefact names,
+verification tiers, and governance requirements are chosen to match
+`contracts/Contracts/CategorySpec.lean`.
+
+---
+
+## Verification Policy and Output Contracts
+
+The starter kit now includes a concrete mapping from workflow class to
+verification tier in `src/verification-policy.ts` and a JSON-schema-backed
+output-contract validator in `src/output-contracts.ts`.
+
+- `service_delivery` settles automatically only after a replayable-test result
+  is `validated`.
+- `formal_semantic_kernel` requires proof-tier `proven` status.
+- `governance_dispute` maps to quorum validation and manual settlement.
+
+`src/reference-examples.ts` contains two complementary Agent Cards plus the
+canonical Project Birch structured output contract and deliverable. The
+reference runnable demo is `demo/run-reference-workflow.ts`.
+
+---
+
 ## MCP Tools
 
-The agent exposes these tools over MCP. All economic tools route through the `SafetyMonitor` and `AuditLogger` before touching any provider.
+The agent exposes both legacy trust primitives and the newer ClawCombinator
+reference-stack tools over MCP. All economic tools route through the
+`SafetyMonitor` and `AuditLogger` before touching any provider.
 
 | Tool | Description |
 |------|-------------|
@@ -149,9 +211,32 @@ The agent exposes these tools over MCP. All economic tools route through the `Sa
 | `balance` | Aggregate balance across all configured providers |
 | `invoice` | Create a structured payment request (JSON invoice) |
 | `escrow` | Time-locked hold — CC-native, no provider needed |
+| `create_escrow` / `fund_escrow` / `release_escrow` / `refund_escrow` | Full escrow lifecycle with the stronger funded-before-release invariant |
+| `post_bond` / `verify_bond` / `claim_bond` / `get_credit_score` | Liability bond and reputation primitives |
+| `read_world_spec` | Return the canonical world-spec URLs and the local Lean source path |
+| `agent_register` / `agent_discover` | Local reference implementation of Agent Card registration and discovery |
+| `escrow_lock` / `bond_post` / `contract_verify` / `reputation_score` / `open_dispute` | Canonical reference-stack tool names aligned to `schemas/mcp-tools.json`, including workflow-class policy and structured output-contract verification |
 | `list_providers` | List registered payment providers |
 | `provider_status` | Health and balance per provider |
 | `example_review` | Document risk analysis (reference capability) |
+
+State-changing MCP calls require a `nonce` or `idempotencyKey`. The starter kit
+caches successful mutation results by tool name plus nonce, replays the cached
+result when the exact same payload is retried, and rejects reuse of the same
+nonce with a different payload.
+
+For the canonical service-delivery flow, `escrow_lock` stores the declared
+verification requirement, `contract_verify` records the verification result
+against the escrow, and `release_escrow` refuses settlement until the stored
+result satisfies the required tier and settlement rules.
+
+Versioning and auth expectations:
+
+- Canonical reference-stack tools expect `spec_version: 0.1.0`.
+- `read_world_spec` resolves against `contracts/Contracts/CategorySpec.lean`,
+  which mirrors `https://clawcombinator.ai/formal/category_spec.lean`.
+- The local starter server does not ship network auth by default. Treat it as a
+  local or private reference implementation until the public gateway is live.
 
 ---
 

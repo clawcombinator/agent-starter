@@ -2,7 +2,7 @@
 // Tests for escrow, bond, and credit score primitives.
 //
 // Tests cover:
-//   - Extended escrow lifecycle: create → verify → release
+//   - Extended escrow lifecycle: create → fund → verify → release
 //   - Extended escrow timeout / refund
 //   - Bond posting and verification
 //   - Bond claim flow
@@ -89,7 +89,7 @@ describe('Extended Escrow and Trust primitives', () => {
   });
 
   // ----------------------------------------------------------
-  // Extended escrow lifecycle: create → verify → release
+  // Extended escrow lifecycle: create → fund → verify → release
   // ----------------------------------------------------------
 
   describe('Extended escrow lifecycle', () => {
@@ -169,6 +169,26 @@ describe('Extended Escrow and Trust primitives', () => {
       ).rejects.toThrow('Escrow not found');
     });
 
+    it('fundEscrow locks funds and marks the escrow as funded', async () => {
+      const created = await economic.createEscrow({
+        amount: 250,
+        currency: 'USDC',
+        buyerAgentId: 'agent_buyer',
+        beneficiaryAgentId: 'agent_seller',
+        completionCriteria: 'Funding test',
+        timeoutSeconds: 3600,
+        disputeResolutionMethod: 'automatic',
+      });
+
+      const funded = await economic.fundEscrow(created.escrowId, 'agent_buyer');
+      const verified = await economic.verifyEscrow(created.escrowId);
+
+      expect(funded.status).toBe('funded');
+      expect(funded.buyerAgentId).toBe('agent_buyer');
+      expect(funded.transactionId).toBeTruthy();
+      expect(verified.status).toBe('funded');
+    });
+
     it('releaseEscrow transfers funds and sets status to released', async () => {
       const created = await economic.createEscrow({
         amount: 500,
@@ -178,6 +198,7 @@ describe('Extended Escrow and Trust primitives', () => {
         timeoutSeconds: 3600,
         disputeResolutionMethod: 'automatic',
       });
+      await economic.fundEscrow(created.escrowId);
 
       const released = await economic.releaseEscrow(
         created.escrowId,
@@ -201,11 +222,12 @@ describe('Extended Escrow and Trust primitives', () => {
         timeoutSeconds: 3600,
         disputeResolutionMethod: 'automatic',
       });
+      await economic.fundEscrow(created.escrowId);
 
       await economic.releaseEscrow(created.escrowId);
 
-      // provider.pay should have been called for the release transfer
-      expect(provider.pay).toHaveBeenCalledOnce();
+      // One call funds the escrow, the second releases it.
+      expect(provider.pay).toHaveBeenCalledTimes(2);
     });
 
     it('releaseEscrow records extended_escrow_released in the audit log', async () => {
@@ -217,6 +239,7 @@ describe('Extended Escrow and Trust primitives', () => {
         timeoutSeconds: 3600,
         disputeResolutionMethod: 'automatic',
       });
+      await economic.fundEscrow(created.escrowId);
 
       await economic.releaseEscrow(created.escrowId, 'https://evidence.example.com/delivery.pdf');
 
@@ -233,6 +256,7 @@ describe('Extended Escrow and Trust primitives', () => {
         timeoutSeconds: 3600,
         disputeResolutionMethod: 'automatic',
       });
+      await economic.fundEscrow(created.escrowId);
 
       await economic.releaseEscrow(created.escrowId);
 
@@ -309,6 +333,7 @@ describe('Extended Escrow and Trust primitives', () => {
         timeoutSeconds: 3600,
         disputeResolutionMethod: 'automatic',
       });
+      await economic.fundEscrow(created.escrowId);
 
       await economic.releaseEscrow(created.escrowId);
 
@@ -633,6 +658,7 @@ describe('Extended Escrow and Trust primitives', () => {
         timeoutSeconds: 3600,
         disputeResolutionMethod: 'automatic',
       });
+      await economic.fundEscrow(created.escrowId);
       await economic.releaseEscrow(created.escrowId, 'https://delivery.example.com/report.pdf');
 
       // Force a new score computation by using a fresh instance that shares stores
@@ -720,6 +746,7 @@ describe('Extended Escrow and Trust primitives', () => {
     });
 
     await economic.verifyEscrow(created.escrowId);
+    await economic.fundEscrow(created.escrowId);
     await economic.releaseEscrow(created.escrowId, 'https://delivery.example.com/result.pdf');
 
     // File a claim against the bond

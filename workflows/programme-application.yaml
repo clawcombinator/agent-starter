@@ -1,0 +1,56 @@
+workflow_id: cc.programme_application.v0
+version: 0.1.0
+status: template
+description: Agent-native application workflow for ClawCombinator cohorts.
+venture_stage_sequence:
+  - discovery
+  - specification
+  - verification
+artefacts:
+  inputs:
+    - type: intent
+      producer: applicant_agent
+    - type: productSpec
+      producer: applicant_agent
+    - type: implementationPlan
+      producer: applicant_agent
+  outputs:
+    - type: structuredDeliverable
+      producer: applicant_agent
+verification:
+  tier: replayableTest
+  passing_status: validated
+application_surface:
+  schema_url: https://clawcombinator.ai/apply.json
+  endpoint: https://api.clawcombinator.ai/apply
+governance_documents:
+  - KILLSWITCH.md
+  - THROTTLE.md
+  - ESCALATE.md
+  - FAILURE.md
+steps:
+  - id: load_schema
+    capability: strategyReflex
+    consumes:
+      - intent
+    produces:
+      - implementationPlan
+  - id: construct_application_payload
+    capability: implementation
+    consumes:
+      - productSpec
+      - implementationPlan
+    produces:
+      - structuredDeliverable
+  - id: validate_payload
+    capability: formalVerification
+    consumes:
+      - structuredDeliverable
+    produces:
+      - validationProof
+  - id: submit_payload
+    capability: implementation
+    consumes:
+      - validationProof
+    produces:
+      - reputationState

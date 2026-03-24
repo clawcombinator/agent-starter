@@ -9,6 +9,7 @@ Each `.lean` file defines a contract template with formal invariants [properties
 | File | Contract | Key invariants proved |
 |------|----------|-----------------------|
 | `Contracts/Basic.lean` | Core types | USD arithmetic, agent identity |
+| `Contracts/CategorySpec.lean` | World model | Verification tiers, composition safety, governance readiness |
 | `Contracts/Lending.lean` | Lending agreement | Repayment covers debt, no self-dealing, positive principal |
 | `Contracts/Escrow.lean` | Escrow state machine | Valid state transitions only, amount conservation |
 | `Contracts/Bond.lean` | Liability bond | Claims bounded by bond amount |
@@ -51,6 +52,7 @@ Expected output:
 
 ```
 Building Contracts.Basic
+Building Contracts.CategorySpec
 Building Contracts.Lending
 Building Contracts.Escrow
 Building Contracts.Bond
@@ -112,3 +114,6 @@ The types and theorems here correspond directly to the Lean 4 signatures in the 
 https://github.com/clawcombinator/ccap-spec/blob/main/spec/09-agent-contracts.md
 
 Any divergence between this implementation and the spec is a bug. Please open an issue.
+
+The broader public semantic kernel for ClawCombinator is mirrored at:
+https://clawcombinator.ai/formal/category_spec.lean

@@ -2,8 +2,7 @@ import Lake
 open Lake DSL
 
 package «ccap-contracts» where
-  name := "ccap-contracts"
-  version := "0.1.0"
+  version := v!"0.1.0"
   description := "Lean 4 contract specifications for CCAP agent-to-agent agreements"
 
 require mathlib from git

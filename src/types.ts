@@ -149,6 +149,7 @@ export type DisputeResolutionMethod = 'arbitration_agent' | 'multi_sig' | 'autom
 export interface CreateEscrowParams {
   amount: number;
   currency: string;
+  buyerAgentId?: string;
   beneficiaryAgentId: string;
   completionCriteria: string;
   timeoutSeconds: number;
@@ -193,6 +194,17 @@ export interface ReleaseEscrowResult {
   transactionId: string;
 }
 
+export interface FundEscrowResult {
+  escrowId: string;
+  status: 'funded';
+  amount: number;
+  currency: string;
+  buyerAgentId: string;
+  beneficiaryAgentId: string;
+  fundedAt: string;
+  transactionId: string;
+}
+
 export interface RefundEscrowResult {
   escrowId: string;
   status: 'refunded';
@@ -220,6 +232,7 @@ export interface ExtendedEscrowRecord {
   releasedAt?: string;
   refundedAt?: string;
   completionEvidence?: string;
+  disputeId?: string;
   idempotencyKey?: string;
 }
 
@@ -238,6 +251,7 @@ export type BondScope =
 export type BondStatusValue = 'active' | 'expired' | 'fully_claimed' | 'released';
 
 export interface PostBondParams {
+  agentId?: string;
   amount: number;
   currency: string;
   scope: BondScope;
@@ -324,6 +338,151 @@ export interface ClaimBondResult {
   claimAmount: number;
   arbitrationAgentId: string;
   reviewDeadline: string;
+}
+
+// ------------------------------------------------------------
+// Disputes and Verification
+// ------------------------------------------------------------
+
+export type VerificationTier = 'proof' | 'replayableTest' | 'quorum';
+export type VerificationStatus = 'proven' | 'validated' | 'rejected' | 'resourceHit';
+
+export interface OpenDisputeParams {
+  escrowId: string;
+  claimantAgentId: string;
+  reason: string;
+  evidenceRefs?: string[];
+  idempotencyKey?: string;
+}
+
+export interface OpenDisputeResult {
+  disputeId: string;
+  status: 'open';
+  disputeRecordType: 'disputeRecord';
+  openedAt: string;
+  escrowId: string;
+  claimantAgentId: string;
+  reason: string;
+  evidenceRefs: string[];
+  arbitrationAgentId?: string;
+}
+
+export interface DisputeRecord extends OpenDisputeResult {
+  specVersion: string;
+}
+
+export interface ContractVerifyResult {
+  subject: string;
+  tier: VerificationTier;
+  status: VerificationStatus;
+  evidence_ref: string;
+  reviewer: string;
+}
+
+export interface AgentCardDocument {
+  agent_id: string;
+  capability:
+    | 'marketScanning'
+    | 'syntheticSimulation'
+    | 'implementation'
+    | 'formalVerification'
+    | 'settlementRouting'
+    | 'agentDiscovery'
+    | 'strategyReflex'
+    | 'governanceAudit';
+  spec_version: string;
+  reputation_score: number;
+  bond_capacity_usd_cents: number;
+  supports_mcp: boolean;
+  supports_a2a: boolean;
+  contract: {
+    name: string;
+    input_type:
+      | 'marketSignal'
+      | 'hypothesis'
+      | 'syntheticUser'
+      | 'userFeedback'
+      | 'intent'
+      | 'productSpec'
+      | 'implementationPlan'
+      | 'implementedSystem'
+      | 'structuredDeliverable'
+      | 'validationProof'
+      | 'deployedProduct'
+      | 'revenueSignal'
+      | 'reputationState'
+      | 'disputeRecord';
+    output_type:
+      | 'marketSignal'
+      | 'hypothesis'
+      | 'syntheticUser'
+      | 'userFeedback'
+      | 'intent'
+      | 'productSpec'
+      | 'implementationPlan'
+      | 'implementedSystem'
+      | 'structuredDeliverable'
+      | 'validationProof'
+      | 'deployedProduct'
+      | 'revenueSignal'
+      | 'reputationState'
+      | 'disputeRecord';
+    required_tier: VerificationTier;
+    mutates_state: boolean;
+    idempotent_by_nonce: boolean;
+    escrow_required: boolean;
+    spec_version: string;
+  };
+}
+
+export interface OutputContractDocument {
+  contract_id: string;
+  name: string;
+  spec_version: string;
+  workflow_class: string;
+  input_type:
+    | 'marketSignal'
+    | 'hypothesis'
+    | 'syntheticUser'
+    | 'userFeedback'
+    | 'intent'
+    | 'productSpec'
+    | 'implementationPlan'
+    | 'implementedSystem'
+    | 'structuredDeliverable'
+    | 'validationProof'
+    | 'deployedProduct'
+    | 'revenueSignal'
+    | 'reputationState'
+    | 'disputeRecord';
+  output_type:
+    | 'marketSignal'
+    | 'hypothesis'
+    | 'syntheticUser'
+    | 'userFeedback'
+    | 'intent'
+    | 'productSpec'
+    | 'implementationPlan'
+    | 'implementedSystem'
+    | 'structuredDeliverable'
+    | 'validationProof'
+    | 'deployedProduct'
+    | 'revenueSignal'
+    | 'reputationState'
+    | 'disputeRecord';
+  verification_tier: VerificationTier;
+  deliverable_schema: Record<string, unknown>;
+  settlement_rules: {
+    requires_funded_escrow: boolean;
+    required_verification_statuses: VerificationStatus[];
+  };
+  example_subject_ref?: string;
+}
+
+export interface OutputContractValidationResult {
+  valid: boolean;
+  errors: string[];
+  evidenceRef: string;
 }
 
 // ------------------------------------------------------------

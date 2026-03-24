@@ -36,13 +36,17 @@ import type {
   CreditScoreTier,
   CreateEscrowParams,
   CreateEscrowResult,
+  DisputeRecord,
   EscrowParams,
   EscrowRecord,
   EscrowResult,
   EscrowStatusResult,
   ExtendedEscrowRecord,
+  FundEscrowResult,
   InvoiceParams,
   InvoiceResult,
+  OpenDisputeParams,
+  OpenDisputeResult,
   PaymentParams,
   PostBondParams,
   RefundEscrowResult,
@@ -55,6 +59,8 @@ const invoiceStore = new Map<string, InvoiceResult & InvoiceParams>();
 const escrowStore = new Map<string, EscrowRecord>();
 const extendedEscrowStore = new Map<string, ExtendedEscrowRecord>();
 const bondStore = new Map<string, BondRecord>();
+const disputeStore = new Map<string, DisputeRecord>();
+const MAX_TIMEOUT_MS = 2_147_483_647;
 // creditScoreStore is keyed by agent_id. In production this would be
 // populated from the CCAP registry. Here we seed a minimal computed score.
 const creditScoreStore = new Map<string, CreditScore>();
@@ -234,7 +240,12 @@ export class CCAPEconomic {
     });
 
     // Schedule automatic expiry
-    setTimeout(() => void this.expireEscrow(escrowId), params.timeoutSeconds * 1000);
+    this.scheduleDeferredTimer(
+      params.timeoutSeconds * 1000,
+      () => void this.expireEscrow(escrowId),
+      'escrow_expiry',
+      { escrowId },
+    );
 
     return {
       escrowId,
@@ -254,6 +265,10 @@ export class CCAPEconomic {
   // ----------------------------------------------------------
 
   async createEscrow(params: CreateEscrowParams): Promise<CreateEscrowResult> {
+    if (params.disputeResolutionMethod === 'arbitration_agent' && !params.arbitrationAgentId) {
+      throw new Error('arbitrationAgentId is required when disputeResolutionMethod=arbitration_agent');
+    }
+
     const check = await this.safety.checkOperation({
       type: 'escrow',
       costUsd: params.amount,
@@ -274,7 +289,7 @@ export class CCAPEconomic {
       status: 'created',
       amount: params.amount,
       currency: params.currency,
-      buyerAgentId: 'self',
+      buyerAgentId: params.buyerAgentId ?? 'self',
       beneficiaryAgentId: params.beneficiaryAgentId,
       completionCriteria: params.completionCriteria,
       disputeResolutionMethod: params.disputeResolutionMethod,
@@ -285,6 +300,7 @@ export class CCAPEconomic {
     };
 
     extendedEscrowStore.set(escrowId, record);
+    this.invalidateCreditScores([record.buyerAgentId, record.beneficiaryAgentId]);
 
     this.audit.record('extended_escrow_created', {
       escrowId,
@@ -296,7 +312,12 @@ export class CCAPEconomic {
     });
 
     // Schedule automatic expiry
-    setTimeout(() => void this.expireExtendedEscrow(escrowId), params.timeoutSeconds * 1000);
+    this.scheduleDeferredTimer(
+      params.timeoutSeconds * 1000,
+      () => void this.expireExtendedEscrow(escrowId),
+      'extended_escrow_expiry',
+      { escrowId },
+    );
 
     return {
       escrowId,
@@ -306,6 +327,66 @@ export class CCAPEconomic {
       beneficiaryAgentId: params.beneficiaryAgentId,
       createdAt: now,
       expiresAt,
+    };
+  }
+
+  // ----------------------------------------------------------
+  // fundEscrow — lock buyer funds against an existing escrow
+  //
+  // Settlement is only allowed once status is 'funded'. This
+  // enforces the "no settlement without funded escrow" invariant.
+  // ----------------------------------------------------------
+
+  async fundEscrow(escrowId: string, buyerAgentId?: string): Promise<FundEscrowResult> {
+    const record = extendedEscrowStore.get(escrowId);
+
+    if (!record) {
+      throw new Error(`Escrow not found: ${escrowId}`);
+    }
+
+    if (record.status !== 'created') {
+      throw new Error(`Escrow ${escrowId} cannot be funded: status is '${record.status}'`);
+    }
+
+    const payResult = await this.router.route({
+      amount: record.amount,
+      currency: record.currency,
+      recipient: `ccap_escrow_lock:${escrowId}`,
+      memo: `Escrow funding: ${escrowId}`,
+      idempotencyKey: record.idempotencyKey ?? `escrow_fund_${escrowId}`,
+    });
+
+    const fundedAt = new Date().toISOString();
+    const nextBuyerAgentId = buyerAgentId ?? record.buyerAgentId;
+
+    extendedEscrowStore.set(escrowId, {
+      ...record,
+      buyerAgentId: nextBuyerAgentId,
+      status: 'funded',
+      fundedAt,
+    });
+
+    this.invalidateCreditScores([nextBuyerAgentId, record.beneficiaryAgentId]);
+
+    this.audit.record('extended_escrow_funded', {
+      escrowId,
+      amount: record.amount,
+      currency: record.currency,
+      buyerAgentId: nextBuyerAgentId,
+      beneficiaryAgentId: record.beneficiaryAgentId,
+      fundedAt,
+      transactionId: payResult.transactionId,
+    });
+
+    return {
+      escrowId,
+      status: 'funded',
+      amount: record.amount,
+      currency: record.currency,
+      buyerAgentId: nextBuyerAgentId,
+      beneficiaryAgentId: record.beneficiaryAgentId,
+      fundedAt,
+      transactionId: payResult.transactionId,
     };
   }
 
@@ -353,7 +434,7 @@ export class CCAPEconomic {
       throw new Error(`Escrow not found: ${escrowId}`);
     }
 
-    if (record.status !== 'funded' && record.status !== 'created') {
+    if (record.status !== 'funded') {
       throw new Error(`Escrow ${escrowId} cannot be released: status is '${record.status}'`);
     }
 
@@ -373,6 +454,7 @@ export class CCAPEconomic {
       releasedAt,
       completionEvidence,
     });
+    this.invalidateCreditScores([record.buyerAgentId, record.beneficiaryAgentId]);
 
     this.audit.record('extended_escrow_released', {
       escrowId,
@@ -429,6 +511,7 @@ export class CCAPEconomic {
       status: 'refunded',
       refundedAt,
     });
+    this.invalidateCreditScores([record.buyerAgentId, record.beneficiaryAgentId]);
 
     this.audit.record('extended_escrow_refunded', {
       escrowId,
@@ -481,12 +564,10 @@ export class CCAPEconomic {
       memo: `Bond lock: ${bondId} scope=${params.scope}`,
     });
 
-    this.safety.recordSpend(params.amount);
-
     const record: BondRecord = {
       bondId,
       status: 'active',
-      agentId: 'self',
+      agentId: params.agentId ?? 'self',
       amount: params.amount,
       remainingAmount: params.amount,
       currency: params.currency,
@@ -503,18 +584,25 @@ export class CCAPEconomic {
     };
 
     bondStore.set(bondId, record);
+    this.invalidateCreditScores([record.agentId]);
 
     this.audit.record('bond_posted', {
       bondId,
       amount: params.amount,
       currency: params.currency,
       scope: params.scope,
+      agentId: record.agentId,
       expiresAt,
       transactionId: payResult.transactionId,
     });
 
     // Schedule automatic release when bond period ends
-    setTimeout(() => void this.releaseBondOnExpiry(bondId), params.durationSeconds * 1000);
+    this.scheduleDeferredTimer(
+      params.durationSeconds * 1000,
+      () => void this.releaseBondOnExpiry(bondId),
+      'bond_release',
+      { bondId },
+    );
 
     return {
       bondId,
@@ -522,7 +610,7 @@ export class CCAPEconomic {
       amount: params.amount,
       currency: params.currency,
       scope: params.scope,
-      agentId: 'self',
+      agentId: record.agentId,
       activeFrom: now,
       expiresAt,
       transactionId: payResult.transactionId,
@@ -536,18 +624,12 @@ export class CCAPEconomic {
   // ----------------------------------------------------------
 
   verifyBond(agentId: string, scope?: BondScope): VerifyBondResult {
-    // In the starter kit, bondStore holds only this agent's bonds (agentId === 'self').
-    // Querying an external agent's bonds would call the CC registry API in production.
-    // Return empty for any agentId that is not 'self'.
-    const isSelf = agentId === 'self';
-
-    const activeBonds = isSelf
-      ? Array.from(bondStore.values()).filter(
-          (b) =>
-            b.status === 'active' &&
-            (scope === undefined || b.scope === scope),
-        )
-      : [];
+    const activeBonds = Array.from(bondStore.values()).filter(
+      (b) =>
+        b.agentId === agentId &&
+        b.status === 'active' &&
+        (scope === undefined || b.scope === scope),
+    );
 
     if (activeBonds.length === 0) {
       this.audit.record('bond_verified_none', { agentId, scope });
@@ -625,6 +707,7 @@ export class CCAPEconomic {
       ...bond,
       claimsHistory: [...bond.claimsHistory, claimRecord],
     });
+    this.invalidateCreditScores([bond.agentId, params.claimedBy]);
 
     this.audit.record('bond_claim_filed', {
       claimId,
@@ -648,6 +731,69 @@ export class CCAPEconomic {
   }
 
   // ----------------------------------------------------------
+  // openDispute — move an escrow into a disputed state
+  // ----------------------------------------------------------
+
+  async openDispute(params: OpenDisputeParams): Promise<OpenDisputeResult> {
+    const record = extendedEscrowStore.get(params.escrowId);
+
+    if (!record) {
+      throw new Error(`Escrow not found: ${params.escrowId}`);
+    }
+
+    if (record.status === 'refunded' || record.status === 'expired') {
+      throw new Error(`Escrow ${params.escrowId} cannot be disputed from status '${record.status}'`);
+    }
+
+    const disputeId = `dispute_${crypto.randomBytes(8).toString('hex')}`;
+    const openedAt = new Date().toISOString();
+    const evidenceRefs = params.evidenceRefs ?? [];
+
+    extendedEscrowStore.set(params.escrowId, {
+      ...record,
+      status: 'disputed',
+      disputeId,
+    });
+
+    const dispute: DisputeRecord = {
+      disputeId,
+      status: 'open',
+      disputeRecordType: 'disputeRecord',
+      openedAt,
+      escrowId: params.escrowId,
+      claimantAgentId: params.claimantAgentId,
+      reason: params.reason,
+      evidenceRefs,
+      arbitrationAgentId: record.arbitrationAgentId,
+      specVersion: '0.1.0',
+    };
+
+    disputeStore.set(disputeId, dispute);
+    this.invalidateCreditScores([record.buyerAgentId, record.beneficiaryAgentId, params.claimantAgentId]);
+
+    this.audit.record('escrow_dispute_opened', {
+      disputeId,
+      escrowId: params.escrowId,
+      claimantAgentId: params.claimantAgentId,
+      reason: params.reason,
+      evidenceRefs,
+      arbitrationAgentId: record.arbitrationAgentId,
+    });
+
+    return {
+      disputeId,
+      status: 'open',
+      disputeRecordType: 'disputeRecord',
+      openedAt,
+      escrowId: params.escrowId,
+      claimantAgentId: params.claimantAgentId,
+      reason: params.reason,
+      evidenceRefs,
+      arbitrationAgentId: record.arbitrationAgentId,
+    };
+  }
+
+  // ----------------------------------------------------------
   // getCreditScore — query credit score from the CC registry
   //
   // In this starter kit the score is computed from the in-memory
@@ -664,8 +810,12 @@ export class CCAPEconomic {
     }
 
     // Derive a basic score from the in-memory bond and escrow history
-    const agentBonds = Array.from(bondStore.values());
-    const agentEscrows = Array.from(extendedEscrowStore.values());
+    const agentBonds = Array.from(bondStore.values()).filter((bond) => bond.agentId === agentId);
+    const agentEscrows = Array.from(extendedEscrowStore.values()).filter(
+      (escrow) =>
+        escrow.beneficiaryAgentId === agentId ||
+        escrow.buyerAgentId === agentId,
+    );
 
     const completedEscrows = agentEscrows.filter((e) => e.status === 'released');
     const disputedEscrows = agentEscrows.filter((e) => e.status === 'disputed');
@@ -780,6 +930,18 @@ export class CCAPEconomic {
     return bondStore.get(bondId);
   }
 
+  getDispute(disputeId: string): DisputeRecord | undefined {
+    return disputeStore.get(disputeId);
+  }
+
+  listBonds(agentId?: string): BondRecord[] {
+    const bonds = Array.from(bondStore.values());
+    if (!agentId) {
+      return bonds;
+    }
+    return bonds.filter((bond) => bond.agentId === agentId);
+  }
+
   private async expireEscrow(escrowId: string): Promise<void> {
     const record = escrowStore.get(escrowId);
     if (!record || record.status !== 'locked') return;
@@ -793,7 +955,13 @@ export class CCAPEconomic {
     const record = extendedEscrowStore.get(escrowId);
     if (!record || (record.status !== 'created' && record.status !== 'funded')) return;
 
+    if (record.status === 'funded') {
+      await this.refundEscrow(escrowId, 'timeout');
+      return;
+    }
+
     extendedEscrowStore.set(escrowId, { ...record, status: 'expired' });
+    this.invalidateCreditScores([record.buyerAgentId, record.beneficiaryAgentId]);
     this.audit.record('extended_escrow_expired', { escrowId });
     // In production, trigger a refund back to the buyer wallet
   }
@@ -810,6 +978,7 @@ export class CCAPEconomic {
     }
 
     bondStore.set(bondId, { ...bond, status: 'released' });
+    this.invalidateCreditScores([bond.agentId]);
     this.audit.record('bond_released', {
       bondId,
       amount: bond.remainingAmount,
@@ -822,6 +991,42 @@ export class CCAPEconomic {
     const ts = Date.now().toString(36);
     const rand = crypto.randomBytes(4).toString('hex');
     return `inv_${ts}_${rand}`;
+  }
+
+  private scheduleDeferredTimer(
+    delayMs: number,
+    callback: () => void,
+    timerType: string,
+    metadata: Record<string, unknown>,
+  ): void {
+    if (delayMs <= MAX_TIMEOUT_MS) {
+      setTimeout(callback, delayMs);
+      return;
+    }
+
+    this.audit.record('timer_schedule_deferred', {
+      timerType,
+      delayMs,
+      maxDelayMs: MAX_TIMEOUT_MS,
+      ...metadata,
+    });
+
+    setTimeout(() => {
+      this.scheduleDeferredTimer(
+        delayMs - MAX_TIMEOUT_MS,
+        callback,
+        timerType,
+        metadata,
+      );
+    }, MAX_TIMEOUT_MS);
+  }
+
+  private invalidateCreditScores(agentIds: string[]): void {
+    for (const agentId of agentIds) {
+      if (agentId) {
+        creditScoreStore.delete(agentId);
+      }
+    }
   }
 }
 
