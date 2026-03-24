@@ -1,5 +1,5 @@
 // ============================================================
-// PaymentRouter — "OpenRouter for agent payments"
+// PaymentRouter — the clearing house for agent payments
 //
 // This is CC's core contribution. The router holds multiple
 // PaymentProvider instances and automatically selects the best

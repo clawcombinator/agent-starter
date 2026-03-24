@@ -5,7 +5,7 @@
 // ============================================================
 
 import crypto from 'node:crypto';
-import { access, readFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -20,6 +20,8 @@ import type {
   Capability,
   ContractVerifyResult,
   OutputContractDocument,
+  RequestAuthEnvelope,
+  SignedVerificationAttestation,
   VerificationStatus,
   VerificationTier,
 } from './types.js';
@@ -30,7 +32,27 @@ import type { PaymentRouter } from './router.js';
 import {
   OperatorIntakeEngine,
 } from './operator-intake.js';
-import { settlementStatusAllowed, validateStructuredDeliverable } from './output-contracts.js';
+import { hashOutputContract, settlementStatusAllowed } from './output-contracts.js';
+import {
+  buildToolRequestSignaturePayload,
+  stripAuthFromArgs,
+  verifyAgentRegistrationSignature,
+  verifyStructuredPayload,
+  verifyVerificationAttestation,
+} from './auth.js';
+import {
+  DurableStateStore,
+  type EscrowVerificationRequirementRecord,
+  type MutationCacheRecord,
+  type RegisteredAgentRegistryEntry,
+  type TrustedOutputContractRecord,
+} from './state-store.js';
+import { VerificationWorker } from './verifier.js';
+import {
+  CLAWCOMBINATOR_INBOUND_TRIAGE_CONTRACT,
+  PROJECT_BIRCH_FINANCIAL_ANALYSIS_CONTRACT,
+} from './reference-examples.js';
+import { stableStringify } from './canonical-json.js';
 import { getVerificationPolicy } from './verification-policy.js';
 import winston from 'winston';
 
@@ -60,31 +82,10 @@ interface ToolDefinition {
   handler(args: Record<string, unknown>): Promise<unknown>;
 }
 
-interface RegisteredAgentEntry {
-  agentCard: AgentCardDocument;
-  signature: string;
-  registeredAt: string;
-}
-
-interface MutationCacheEntry {
-  fingerprint: string;
-  result: unknown;
-  recordedAt: string;
-}
-
 interface ListedTool {
   name: string;
   description: string;
   inputSchema: ToolInputSchema;
-}
-
-interface EscrowVerificationRequirement {
-  contractName: string;
-  workflowClass?: string;
-  verificationTier: VerificationTier;
-  outputContractRef?: string;
-  allowedStatuses: VerificationStatus[];
-  settlementMode: 'automatic' | 'manual';
 }
 
 export class AgentMCPServer {
@@ -92,17 +93,33 @@ export class AgentMCPServer {
   readonly capabilities = new Map<string, Capability>();
   private readonly tools: ToolDefinition[];
   private readonly toolIndex = new Map<string, ToolDefinition>();
-  private readonly mutationCache = new Map<string, MutationCacheEntry>();
-  private readonly agentRegistry = new Map<string, RegisteredAgentEntry>();
-  private readonly escrowVerificationRequirements = new Map<string, EscrowVerificationRequirement>();
+  private readonly mutationCache = new Map<string, MutationCacheRecord>();
+  private readonly agentRegistry = new Map<string, RegisteredAgentRegistryEntry>();
+  private readonly escrowVerificationRequirements = new Map<string, EscrowVerificationRequirementRecord>();
   private readonly escrowVerificationResults = new Map<string, ContractVerifyResult>();
+  private readonly trustedOutputContracts = new Map<string, TrustedOutputContractRecord>();
+  private readonly verificationAttestations = new Map<string, SignedVerificationAttestation>();
   private readonly operatorIntake: OperatorIntakeEngine;
+  private readonly stateStore: DurableStateStore;
+  private readonly verificationWorker: VerificationWorker;
 
   constructor(
     private readonly safety: SafetyMonitor,
     private readonly audit: AuditLogger,
     private readonly economic: CCAPEconomic,
     private readonly router: PaymentRouter,
+    stateStore: DurableStateStore = new DurableStateStore(
+      process.env['CC_RUNTIME_STATE_PATH'] ?? './data/ccap-runtime-state.json',
+    ),
+    verificationWorker: VerificationWorker = new VerificationWorker(
+      {
+        verifierId: process.env['CC_VERIFIER_ID'] ?? 'clawcombinator_platform_verifier_v1',
+        contractsDir: fileURLToPath(new URL('../contracts', import.meta.url)),
+        verifierKeyPath: process.env['CC_VERIFIER_KEY_PATH'] ?? './data/verifier-keypair.json',
+        commandTimeoutMs: Number(process.env['CC_VERIFIER_COMMAND_TIMEOUT_MS'] ?? 600_000),
+      },
+      audit,
+    ),
   ) {
     this.server = new Server(
       {
@@ -114,7 +131,11 @@ export class AgentMCPServer {
       },
     );
 
+    this.stateStore = stateStore;
+    this.verificationWorker = verificationWorker;
     this.operatorIntake = new OperatorIntakeEngine(this.audit);
+    this.loadPersistedState();
+    this.seedTrustedOutputContracts();
 
     this.tools = this.buildTools();
     for (const tool of this.tools) {
@@ -233,7 +254,7 @@ export class AgentMCPServer {
   // ----------------------------------------------------------
 
   private buildTools(): ToolDefinition[] {
-    return [
+    const tools: ToolDefinition[] = [
       {
         name: 'pay',
         description:
@@ -387,17 +408,24 @@ export class AgentMCPServer {
           additionalProperties: false,
         },
         handler: async (args) =>
-          this.economic.createEscrow({
-            amount: args['amount'] as number,
-            currency: args['currency'] as string,
-            buyerAgentId: args['buyerAgentId'] as string | undefined,
-            beneficiaryAgentId: args['beneficiaryAgentId'] as string,
-            completionCriteria: args['completionCriteria'] as string,
-            timeoutSeconds: args['timeoutSeconds'] as number,
-            disputeResolutionMethod: args['disputeResolutionMethod'] as 'arbitration_agent' | 'multi_sig' | 'automatic',
-            arbitrationAgentId: args['arbitrationAgentId'] as string | undefined,
-            idempotencyKey: args['nonce'] as string,
-          }),
+          (() => {
+            const actor = this.requireRequestAuth(args).agent_id;
+            const declaredBuyer = args['buyerAgentId'] as string | undefined;
+            if (declaredBuyer && declaredBuyer !== actor) {
+              throw new Error(`buyerAgentId '${declaredBuyer}' does not match signed actor '${actor}'`);
+            }
+            return this.economic.createEscrow({
+              amount: args['amount'] as number,
+              currency: args['currency'] as string,
+              buyerAgentId: actor,
+              beneficiaryAgentId: args['beneficiaryAgentId'] as string,
+              completionCriteria: args['completionCriteria'] as string,
+              timeoutSeconds: args['timeoutSeconds'] as number,
+              disputeResolutionMethod: args['disputeResolutionMethod'] as 'arbitration_agent' | 'multi_sig' | 'automatic',
+              arbitrationAgentId: args['arbitrationAgentId'] as string | undefined,
+              idempotencyKey: args['nonce'] as string,
+            });
+          })(),
       },
       {
         name: 'fund_escrow',
@@ -415,10 +443,14 @@ export class AgentMCPServer {
           additionalProperties: false,
         },
         handler: async (args) =>
-          this.economic.fundEscrow(
-            args['escrowId'] as string,
-            args['buyerAgentId'] as string | undefined,
-          ),
+          (() => {
+            const actor = this.requireRequestAuth(args).agent_id;
+            this.assertEscrowRole(args['escrowId'] as string, actor, ['buyer']);
+            return this.economic.fundEscrow(
+              args['escrowId'] as string,
+              actor,
+            );
+          })(),
       },
       {
         name: 'verify_escrow',
@@ -459,6 +491,7 @@ export class AgentMCPServer {
             args['escrowId'] as string,
             args['completionEvidence'] as string | undefined,
             args['manualReviewRef'] as string | undefined,
+            this.requireRequestAuth(args).agent_id,
           ),
       },
       {
@@ -477,10 +510,14 @@ export class AgentMCPServer {
           additionalProperties: false,
         },
         handler: async (args) =>
-          this.economic.refundEscrow(
-            args['escrowId'] as string,
-            args['reason'] as string | undefined,
-          ),
+          (() => {
+            const actor = this.requireRequestAuth(args).agent_id;
+            this.assertEscrowRole(args['escrowId'] as string, actor, ['buyer', 'arbitrator']);
+            return this.economic.refundEscrow(
+              args['escrowId'] as string,
+              args['reason'] as string | undefined,
+            );
+          })(),
       },
       {
         name: 'post_bond',
@@ -527,19 +564,26 @@ export class AgentMCPServer {
           additionalProperties: false,
         },
         handler: async (args) =>
-          this.economic.postBond({
-            agentId: args['agentId'] as string | undefined,
-            amount: args['amount'] as number,
-            currency: args['currency'] as string,
-            scope: args['scope'] as import('./types.js').BondScope,
-            scopeDescription: args['scopeDescription'] as string,
-            durationSeconds: args['durationSeconds'] as number,
-            claimConditions: args['claimConditions'] as string,
-            maxClaimAmount: args['maxClaimAmount'] as number,
-            arbitrationAgentId: args['arbitrationAgentId'] as string,
-            humanEscalationThresholdUsd: args['humanEscalationThresholdUsd'] as number | undefined,
-            idempotencyKey: args['nonce'] as string,
-          }),
+          (() => {
+            const actor = this.requireRequestAuth(args).agent_id;
+            const declaredAgentId = args['agentId'] as string | undefined;
+            if (declaredAgentId && declaredAgentId !== actor) {
+              throw new Error(`agentId '${declaredAgentId}' does not match signed actor '${actor}'`);
+            }
+            return this.economic.postBond({
+              agentId: actor,
+              amount: args['amount'] as number,
+              currency: args['currency'] as string,
+              scope: args['scope'] as import('./types.js').BondScope,
+              scopeDescription: args['scopeDescription'] as string,
+              durationSeconds: args['durationSeconds'] as number,
+              claimConditions: args['claimConditions'] as string,
+              maxClaimAmount: args['maxClaimAmount'] as number,
+              arbitrationAgentId: args['arbitrationAgentId'] as string,
+              humanEscalationThresholdUsd: args['humanEscalationThresholdUsd'] as number | undefined,
+              idempotencyKey: args['nonce'] as string,
+            });
+          })(),
       },
       {
         name: 'verify_bond',
@@ -590,14 +634,21 @@ export class AgentMCPServer {
           additionalProperties: false,
         },
         handler: async (args) =>
-          this.economic.claimBond({
-            bondId: args['bondId'] as string,
-            claimedBy: args['claimedBy'] as string,
-            claimAmount: args['claimAmount'] as number,
-            description: args['description'] as string,
-            evidenceUrl: args['evidenceUrl'] as string | undefined,
-            idempotencyKey: args['nonce'] as string,
-          }),
+          (() => {
+            const actor = this.requireRequestAuth(args).agent_id;
+            const claimedBy = args['claimedBy'] as string;
+            if (claimedBy !== actor) {
+              throw new Error(`claimedBy '${claimedBy}' does not match signed actor '${actor}'`);
+            }
+            return this.economic.claimBond({
+              bondId: args['bondId'] as string,
+              claimedBy,
+              claimAmount: args['claimAmount'] as number,
+              description: args['description'] as string,
+              evidenceUrl: args['evidenceUrl'] as string | undefined,
+              idempotencyKey: args['nonce'] as string,
+            });
+          })(),
       },
       {
         name: 'get_credit_score',
@@ -697,6 +748,10 @@ export class AgentMCPServer {
         },
         handler: async (args) => {
           this.assertSupportedSpecVersion(args['spec_version']);
+          const actor = this.requireRequestAuth(args).agent_id;
+          if (actor !== this.operatorIntake.getCapabilityMap().operator_agent_id) {
+            throw new Error(`operator_intake_record is reserved for '${this.operatorIntake.getCapabilityMap().operator_agent_id}'`);
+          }
           return this.operatorIntake.recordInbound({
             channel: args['channel'] as import('./operator-intake.js').InboundChannel,
             sender_id: args['sender_id'] as string,
@@ -794,6 +849,11 @@ export class AgentMCPServer {
         },
         handler: async (args) => {
           this.assertSupportedSpecVersion(args['spec_version']);
+          const actor = this.requireRequestAuth(args).agent_id;
+          const buyerAgentId = args['buyer_agent_id'] as string;
+          if (buyerAgentId !== actor) {
+            throw new Error(`buyer_agent_id '${buyerAgentId}' does not match signed actor '${actor}'`);
+          }
           const workflowClass = args['workflow_class'] as string | undefined;
           const policy = workflowClass ? getVerificationPolicy(workflowClass) : undefined;
           const declaredTier =
@@ -807,10 +867,40 @@ export class AgentMCPServer {
             );
           }
 
+          const outputContractRef = args['output_contract_ref'] as string | undefined;
+          let trustedOutputContract: TrustedOutputContractRecord | undefined;
+          if (outputContractRef) {
+            trustedOutputContract = this.resolveTrustedOutputContract(outputContractRef);
+            if (trustedOutputContract.contract.name !== (args['contract_name'] as string)) {
+              throw new Error(
+                `output_contract_ref '${outputContractRef}' is bound to contract '${trustedOutputContract.contract.name}', not '${args['contract_name'] as string}'`,
+              );
+            }
+            if (trustedOutputContract.contract.verification_tier !== declaredTier) {
+              throw new Error(
+                `output_contract_ref '${outputContractRef}' requires verification_tier '${trustedOutputContract.contract.verification_tier}'`,
+              );
+            }
+            if (
+              workflowClass &&
+              trustedOutputContract.contract.workflow_class !== workflowClass
+            ) {
+              throw new Error(
+                `output_contract_ref '${outputContractRef}' is bound to workflow_class '${trustedOutputContract.contract.workflow_class}', not '${workflowClass}'`,
+              );
+            }
+          }
+
+          if (declaredTier === 'replayableTest' && !outputContractRef) {
+            throw new Error(
+              `contract '${args['contract_name'] as string}' with verification_tier 'replayableTest' requires output_contract_ref at escrow lock time`,
+            );
+          }
+
           const created = await this.economic.createEscrow({
             amount: Number(args['amount_usd_cents']) / 100,
             currency: 'USD',
-            buyerAgentId: args['buyer_agent_id'] as string,
+            buyerAgentId: actor,
             beneficiaryAgentId: args['beneficiary_agent_id'] as string,
             completionCriteria: `${args['contract_name'] as string}: ${args['completion_criteria'] as string}`,
             timeoutSeconds: Number(args['timeout_seconds'] ?? 86_400),
@@ -822,16 +912,18 @@ export class AgentMCPServer {
             contractName: args['contract_name'] as string,
             workflowClass,
             verificationTier: declaredTier,
-            outputContractRef: args['output_contract_ref'] as string | undefined,
+            outputContractRef,
+            outputContractHash: trustedOutputContract?.contentSha256,
             allowedStatuses: this.allowedStatusesForTier(
               declaredTier,
               policy?.passing_status,
             ),
             settlementMode: policy?.settlement_mode ?? 'automatic',
           });
+          this.persistServerState();
           const funded = await this.economic.fundEscrow(
             created.escrowId,
-            args['buyer_agent_id'] as string,
+            actor,
           );
           return {
             escrow_id: funded.escrowId,
@@ -872,8 +964,13 @@ export class AgentMCPServer {
         },
         handler: async (args) => {
           this.assertSupportedSpecVersion(args['spec_version']);
+          const actor = this.requireRequestAuth(args).agent_id;
+          const agentId = args['agent_id'] as string;
+          if (agentId !== actor) {
+            throw new Error(`agent_id '${agentId}' does not match signed actor '${actor}'`);
+          }
           const result = await this.economic.postBond({
-            agentId: args['agent_id'] as string,
+            agentId,
             amount: Number(args['amount_usd_cents']) / 100,
             currency: 'USD',
             scope: this.parseBondScope(args['scope']),
@@ -881,7 +978,7 @@ export class AgentMCPServer {
             durationSeconds: Number(args['duration_hours'] ?? 24) * 60 * 60,
             claimConditions: args['claim_conditions'] as string,
             maxClaimAmount: Number(args['amount_usd_cents']) / 100,
-            arbitrationAgentId: args['agent_id'] as string,
+            arbitrationAgentId: agentId,
             idempotencyKey: args['nonce'] as string,
           });
           return {
@@ -893,9 +990,35 @@ export class AgentMCPServer {
         },
       },
       {
+        name: 'output_contract_register',
+        description:
+          'Register a trusted output contract and pin its content hash for future settlement workflows. State-changing calls require a nonce.',
+        mutatesState: true,
+        inputSchema: {
+          type: 'object',
+          required: ['output_contract', 'nonce', 'spec_version'],
+          properties: {
+            output_contract: {
+              type: 'object',
+              description: 'Output contract document aligned to output-contract.schema.json',
+            },
+            nonce: { type: 'string' },
+            spec_version: { type: 'string' },
+          },
+          additionalProperties: false,
+        },
+        handler: async (args) =>
+          this.registerOutputContract(
+            args['output_contract'] as OutputContractDocument,
+            args['spec_version'] as string,
+            this.requireRequestAuth(args).agent_id,
+          ),
+      },
+      {
         name: 'contract_verify',
         description:
           'Evaluate whether a contract subject satisfies the declared verification tier.',
+        mutatesState: true,
         inputSchema: {
           type: 'object',
           required: [
@@ -903,6 +1026,7 @@ export class AgentMCPServer {
             'subject_type',
             'subject_ref',
             'verification_tier',
+            'nonce',
             'spec_version',
           ],
           properties: {
@@ -928,6 +1052,13 @@ export class AgentMCPServer {
               type: 'array',
               items: { type: 'string' },
             },
+            reviewer_attestations: {
+              type: 'array',
+              items: {
+                type: 'object',
+              },
+            },
+            nonce: { type: 'string' },
             spec_version: { type: 'string' },
           },
           additionalProperties: false,
@@ -943,7 +1074,9 @@ export class AgentMCPServer {
             output_contract: args['output_contract'] as OutputContractDocument | undefined,
             subject_payload: args['subject_payload'],
             evidence_refs: (args['evidence_refs'] as string[] | undefined) ?? [],
+            reviewer_attestations: (args['reviewer_attestations'] as SignedVerificationAttestation[] | undefined) ?? [],
             spec_version: args['spec_version'] as string,
+            auth: this.requireRequestAuth(args),
           }),
       },
       {
@@ -1002,9 +1135,15 @@ export class AgentMCPServer {
         },
         handler: async (args) => {
           this.assertSupportedSpecVersion(args['spec_version']);
+          const actor = this.requireRequestAuth(args).agent_id;
+          const claimantAgentId = args['claimant_agent_id'] as string;
+          if (claimantAgentId !== actor) {
+            throw new Error(`claimant_agent_id '${claimantAgentId}' does not match signed actor '${actor}'`);
+          }
+          this.assertDisputeRole(args['escrow_id'] as string, actor);
           const dispute = await this.economic.openDispute({
             escrowId: args['escrow_id'] as string,
-            claimantAgentId: args['claimant_agent_id'] as string,
+            claimantAgentId: actor,
             reason: args['reason'] as string,
             evidenceRefs: (args['evidence_refs'] as string[] | undefined) ?? [],
             idempotencyKey: args['nonce'] as string,
@@ -1018,6 +1157,38 @@ export class AgentMCPServer {
         },
       },
     ];
+
+    return tools.map((tool) => {
+      if (!tool.mutatesState || tool.name === 'agent_register') {
+        return tool;
+      }
+
+      const properties = {
+        ...(tool.inputSchema.properties ?? {}),
+        auth: {
+          type: 'object',
+          required: ['agent_id', 'key_id', 'signed_at', 'signature'],
+          properties: {
+            agent_id: { type: 'string' },
+            key_id: { type: 'string' },
+            signed_at: { type: 'string' },
+            signature: { type: 'string' },
+          },
+          additionalProperties: false,
+        },
+      };
+      const required = Array.from(new Set([...(tool.inputSchema.required ?? []), 'auth']));
+
+      return {
+        ...tool,
+        inputSchema: {
+          ...tool.inputSchema,
+          properties,
+          required,
+          additionalProperties: false,
+        },
+      };
+    });
   }
 
   // ----------------------------------------------------------
@@ -1029,13 +1200,17 @@ export class AgentMCPServer {
     requestedName: string,
     args: Record<string, unknown>,
   ): Promise<unknown> {
+    if (requestedName !== 'agent_register') {
+      this.authenticateMutationRequest(requestedName, args);
+    }
+
     const nonce = this.readMutationNonce(args);
     if (!nonce) {
       throw new Error(`Tool ${requestedName} requires a nonce or idempotencyKey`);
     }
 
     const cacheKey = `${requestedName}:${nonce}`;
-    const fingerprint = this.stableStringify(args);
+    const fingerprint = stableStringify(stripAuthFromArgs(args));
     const cached = this.mutationCache.get(cacheKey);
 
     if (cached) {
@@ -1052,6 +1227,7 @@ export class AgentMCPServer {
       result,
       recordedAt: new Date().toISOString(),
     });
+    this.persistServerState();
     return result;
   }
 
@@ -1065,20 +1241,124 @@ export class AgentMCPServer {
     return undefined;
   }
 
-  private stableStringify(value: unknown): string {
-    if (value === null || typeof value !== 'object') {
-      return JSON.stringify(value);
+  private requireRequestAuth(args: Record<string, unknown>): RequestAuthEnvelope {
+    const auth = args['auth'];
+    if (!auth || typeof auth !== 'object') {
+      throw new Error('auth is required for this mutation');
     }
 
-    if (Array.isArray(value)) {
-      return `[${value.map((item) => this.stableStringify(item)).join(',')}]`;
+    const authRecord = auth as Record<string, unknown>;
+    const agent_id = authRecord['agent_id'];
+    const key_id = authRecord['key_id'];
+    const signed_at = authRecord['signed_at'];
+    const signature = authRecord['signature'];
+
+    if (
+      typeof agent_id !== 'string' ||
+      typeof key_id !== 'string' ||
+      typeof signed_at !== 'string' ||
+      typeof signature !== 'string'
+    ) {
+      throw new Error('auth must include string agent_id, key_id, signed_at, and signature fields');
     }
 
-    const objectValue = value as Record<string, unknown>;
-    const pairs = Object.keys(objectValue)
-      .sort()
-      .map((key) => `${JSON.stringify(key)}:${this.stableStringify(objectValue[key])}`);
-    return `{${pairs.join(',')}}`;
+    return {
+      agent_id,
+      key_id,
+      signed_at,
+      signature,
+    };
+  }
+
+  private authenticateMutationRequest(
+    toolName: string,
+    args: Record<string, unknown>,
+  ): RegisteredAgentRegistryEntry {
+    const auth = this.requireRequestAuth(args);
+    const entry = this.agentRegistry.get(auth.agent_id);
+    if (!entry) {
+      throw new Error(`Unknown agent_id '${auth.agent_id}' for signed mutation`);
+    }
+
+    const signingKey = entry.agentCard.auth.signing_keys.find((key) => key.key_id === auth.key_id);
+    if (!signingKey) {
+      throw new Error(`Agent '${auth.agent_id}' does not have signing key '${auth.key_id}'`);
+    }
+
+    const valid = verifyStructuredPayload(
+      buildToolRequestSignaturePayload(toolName, args, {
+        agent_id: auth.agent_id,
+        key_id: auth.key_id,
+        signed_at: auth.signed_at,
+      }),
+      signingKey.public_key_pem,
+      auth.signature,
+    );
+
+    if (!valid) {
+      throw new Error(`Invalid signed mutation request for tool ${toolName}`);
+    }
+
+    return entry;
+  }
+
+  private loadPersistedState(): void {
+    const persisted = this.stateStore.read();
+    for (const [cacheKey, record] of Object.entries(persisted.mutationCache)) {
+      this.mutationCache.set(cacheKey, record);
+    }
+    for (const [agentId, record] of Object.entries(persisted.agentRegistry)) {
+      this.agentRegistry.set(agentId, record);
+    }
+    for (const [escrowId, record] of Object.entries(persisted.escrowVerificationRequirements)) {
+      this.escrowVerificationRequirements.set(escrowId, record);
+    }
+    for (const [escrowId, record] of Object.entries(persisted.escrowVerificationResults)) {
+      this.escrowVerificationResults.set(escrowId, record);
+    }
+    for (const [contractId, record] of Object.entries(persisted.outputContracts)) {
+      this.trustedOutputContracts.set(contractId, record);
+    }
+    for (const [attestationId, record] of Object.entries(persisted.verificationAttestations)) {
+      this.verificationAttestations.set(attestationId, record);
+    }
+  }
+
+  private persistServerState(): void {
+    this.stateStore.transaction((draft) => {
+      draft.mutationCache = Object.fromEntries(this.mutationCache);
+      draft.agentRegistry = Object.fromEntries(this.agentRegistry);
+      draft.escrowVerificationRequirements = Object.fromEntries(this.escrowVerificationRequirements);
+      draft.escrowVerificationResults = Object.fromEntries(this.escrowVerificationResults);
+      draft.outputContracts = Object.fromEntries(this.trustedOutputContracts);
+      draft.verificationAttestations = Object.fromEntries(this.verificationAttestations);
+    });
+  }
+
+  private seedTrustedOutputContracts(): void {
+    const seeds = [
+      PROJECT_BIRCH_FINANCIAL_ANALYSIS_CONTRACT,
+      CLAWCOMBINATOR_INBOUND_TRIAGE_CONTRACT,
+    ];
+
+    let changed = false;
+    for (const contract of seeds) {
+      if (this.trustedOutputContracts.has(contract.contract_id)) {
+        continue;
+      }
+
+      this.trustedOutputContracts.set(contract.contract_id, {
+        contract,
+        contentSha256: hashOutputContract(contract),
+        registeredBy: 'clawcombinator_seed',
+        registeredAt: new Date().toISOString(),
+      });
+      changed = true;
+    }
+
+    if (changed) {
+      this.persistServerState();
+    }
   }
 
   private async readWorldSpec(requestedVersion: unknown): Promise<Record<string, unknown>> {
@@ -1115,28 +1395,80 @@ export class AgentMCPServer {
     if (agentCard.spec_version !== specVersion || agentCard.contract.spec_version !== specVersion) {
       throw new Error('agent_card spec_version does not match requested spec_version');
     }
+    if (!agentCard.auth || !Array.isArray(agentCard.auth.signing_keys) || agentCard.auth.signing_keys.length === 0) {
+      throw new Error('agent_card.auth.signing_keys must include at least one signing key');
+    }
     if (!agentCard.agent_id || !agentCard.contract?.name) {
       throw new Error('agent_card is missing required identity or contract fields');
+    }
+
+    const verifiedSignature = verifyAgentRegistrationSignature(agentCard, signature);
+    if (!verifiedSignature) {
+      throw new Error(`agent_card registration signature could not be verified for '${agentCard.agent_id}'`);
     }
 
     const registeredAt = new Date().toISOString();
     this.agentRegistry.set(agentCard.agent_id, {
       agentCard,
-      signature,
+      registrationSignature: signature,
+      signatureKeyId: verifiedSignature.keyId,
       registeredAt,
     });
+    this.persistServerState();
 
     this.audit.record('agent_registered', {
       agentId: agentCard.agent_id,
       capability: agentCard.capability,
       contractName: agentCard.contract.name,
       registeredAt,
+      signatureKeyId: verifiedSignature.keyId,
     });
 
     return {
       agent_id: agentCard.agent_id,
       registration_status: 'registered',
       spec_version: specVersion,
+      signature_key_id: verifiedSignature.keyId,
+    };
+  }
+
+  private async registerOutputContract(
+    outputContract: OutputContractDocument,
+    specVersion: string,
+    registeredBy: string,
+  ): Promise<Record<string, unknown>> {
+    this.assertSupportedSpecVersion(specVersion);
+    this.assertOutputContract(outputContract, outputContract.name, specVersion);
+
+    const actor = this.agentRegistry.get(registeredBy);
+    if (!actor) {
+      throw new Error(`Unknown registeredBy agent '${registeredBy}'`);
+    }
+    if (!['formalVerification', 'governanceAudit', 'agentDiscovery'].includes(actor.agentCard.capability)) {
+      throw new Error(`Agent '${registeredBy}' is not allowed to register trusted output contracts`);
+    }
+
+    const contentSha256 = hashOutputContract(outputContract);
+    const registeredAt = new Date().toISOString();
+    this.trustedOutputContracts.set(outputContract.contract_id, {
+      contract: outputContract,
+      contentSha256,
+      registeredBy,
+      registeredAt,
+    });
+    this.persistServerState();
+
+    this.audit.record('output_contract_registered', {
+      contractId: outputContract.contract_id,
+      registeredBy,
+      contentSha256,
+      registeredAt,
+    });
+
+    return {
+      contract_id: outputContract.contract_id,
+      registration_status: 'registered',
+      content_sha256: contentSha256,
     };
   }
 
@@ -1192,11 +1524,16 @@ export class AgentMCPServer {
     output_contract?: OutputContractDocument;
     subject_payload?: unknown;
     evidence_refs: string[];
+    reviewer_attestations: SignedVerificationAttestation[];
     spec_version: string;
+    auth: RequestAuthEnvelope;
   }): Promise<ContractVerifyResult> {
     this.assertSupportedSpecVersion(args.spec_version);
+    if (args.escrow_id) {
+      this.assertVerificationRole(args.escrow_id, args.auth.agent_id);
+    }
 
-    const evidenceRefs = args.evidence_refs ?? [];
+    const subject = `${args.subject_type}:${args.subject_ref}`;
     const requirement = args.escrow_id
       ? this.escrowVerificationRequirements.get(args.escrow_id)
       : undefined;
@@ -1212,29 +1549,51 @@ export class AgentMCPServer {
       );
     }
 
-    const localWorldSpecPath = fileURLToPath(LOCAL_WORLD_SPEC_FILE);
-    const subjectLooksLikeWorldSpec =
-      args.subject_ref === PUBLIC_WORLD_SPEC_URL ||
-      args.subject_ref === localWorldSpecPath ||
-      args.subject_ref.endsWith('CategorySpec.lean');
-
     let status: VerificationStatus;
     let evidenceRef: string;
+    let attestation: SignedVerificationAttestation;
+    let outputContractHash: string | undefined;
+
+    const trustedOutputContract = (() => {
+      const contractRef =
+        requirement?.outputContractRef ??
+        args.output_contract_ref ??
+        args.output_contract?.contract_id;
+      if (!contractRef) {
+        return undefined;
+      }
+      return this.resolveTrustedOutputContract(contractRef);
+    })();
 
     if (args.output_contract) {
-      this.assertOutputContract(args.output_contract, args.contract_name, args.spec_version);
+      if (!trustedOutputContract) {
+        throw new Error(`output_contract '${args.output_contract.contract_id}' must be pre-registered before verification`);
+      }
+      this.assertOutputContract(
+        args.output_contract,
+        args.contract_name,
+        args.spec_version,
+        trustedOutputContract.contentSha256,
+      );
+    }
 
-      if (args.output_contract.verification_tier !== args.verification_tier) {
+    if (trustedOutputContract) {
+      if (trustedOutputContract.contract.name !== args.contract_name) {
         throw new Error(
-          `output_contract '${args.output_contract.contract_id}' requires verification_tier '${args.output_contract.verification_tier}'`,
+          `Trusted output_contract '${trustedOutputContract.contract.contract_id}' does not match contract_name '${args.contract_name}'`,
+        );
+      }
+      if (trustedOutputContract.contract.verification_tier !== args.verification_tier) {
+        throw new Error(
+          `output_contract '${trustedOutputContract.contract.contract_id}' requires verification_tier '${trustedOutputContract.contract.verification_tier}'`,
         );
       }
       if (args.subject_payload === undefined) {
-        throw new Error('subject_payload is required when output_contract is provided');
+        throw new Error('subject_payload is required when verifying against a trusted output contract');
       }
       if (
         requirement?.outputContractRef &&
-        args.output_contract.contract_id !== requirement.outputContractRef &&
+        trustedOutputContract.contract.contract_id !== requirement.outputContractRef &&
         args.output_contract_ref !== requirement.outputContractRef
       ) {
         throw new Error(
@@ -1242,62 +1601,67 @@ export class AgentMCPServer {
         );
       }
 
-      const validation = validateStructuredDeliverable(
-        args.output_contract,
+      const validation = this.verificationWorker.verifyStructuredOutput(
+        trustedOutputContract.contract,
         args.subject_payload,
+        subject,
       );
-      status = validation.valid ? 'validated' : 'rejected';
+      status = validation.status;
       evidenceRef = validation.evidenceRef;
+      attestation = validation.attestation;
+      outputContractHash = validation.outputContractHash;
 
       if (args.escrow_id) {
         this.escrowVerificationRequirements.set(args.escrow_id, {
           contractName: args.contract_name,
-          workflowClass: requirement?.workflowClass ?? args.output_contract.workflow_class,
+          workflowClass: requirement?.workflowClass ?? trustedOutputContract.contract.workflow_class,
           verificationTier: args.verification_tier,
-          outputContractRef: args.output_contract_ref ?? args.output_contract.contract_id,
-          allowedStatuses: args.output_contract.settlement_rules.required_verification_statuses,
+          outputContractRef: args.output_contract_ref ?? trustedOutputContract.contract.contract_id,
+          outputContractHash,
+          allowedStatuses: trustedOutputContract.contract.settlement_rules.required_verification_statuses,
           settlementMode: requirement?.settlementMode ?? 'automatic',
         });
       }
     } else if (args.verification_tier === 'proof') {
-      const proofEvidence = evidenceRefs.find((ref) => ref.startsWith('lean:') || ref.startsWith('proof:'));
-      if (proofEvidence || subjectLooksLikeWorldSpec) {
-        status = 'proven';
-        evidenceRef = proofEvidence ?? PUBLIC_WORLD_SPEC_URL;
-      } else {
-        status = 'resourceHit';
-        evidenceRef = evidenceRefs[0] ?? 'proof-pending';
-      }
+      const proof = this.verificationWorker.verifyProof(args.subject_ref, subject);
+      status = proof.status;
+      evidenceRef = proof.evidenceRef;
+      attestation = proof.attestation;
     } else if (args.verification_tier === 'replayableTest') {
-      const replayEvidence = evidenceRefs[0] ?? (await this.isReadablePath(args.subject_ref) ? args.subject_ref : undefined);
-      if (replayEvidence) {
-        status = 'validated';
-        evidenceRef = replayEvidence;
-      } else {
-        status = 'rejected';
-        evidenceRef = 'missing-replayable-evidence';
-      }
+      throw new Error('replayableTest verification requires a trusted output contract in the current runtime');
     } else {
-      if (evidenceRefs.length >= 2) {
-        status = 'validated';
-        evidenceRef = evidenceRefs[0]!;
-      } else {
-        status = 'resourceHit';
-        evidenceRef = evidenceRefs[0] ?? 'missing-quorum-evidence';
-      }
+      const quorum = this.verificationWorker.aggregateQuorumAttestations(
+        subject,
+        args.verification_tier,
+        args.reviewer_attestations,
+        (verifierId, keyId) => this.resolveAttestationPublicKey(verifierId, keyId),
+      );
+      status = quorum.status;
+      evidenceRef = quorum.evidenceRef;
+      attestation = quorum.attestation;
     }
 
     const result = {
-      subject: `${args.subject_type}:${args.subject_ref}`,
+      subject,
       tier: args.verification_tier,
       status,
       evidence_ref: evidenceRef,
       reviewer: `${process.env['CC_AGENT_ID'] ?? 'agent-starter'}::contract_verify@${WORLD_SPEC_VERSION}`,
+      verified_at: new Date().toISOString(),
+      output_contract_hash: outputContractHash,
+      attestation,
+      quorum_attestations: args.reviewer_attestations.length > 0 ? args.reviewer_attestations : undefined,
     } satisfies ContractVerifyResult;
+
+    this.verificationAttestations.set(attestation.attestation_id, attestation);
+    for (const reviewerAttestation of args.reviewer_attestations) {
+      this.verificationAttestations.set(reviewerAttestation.attestation_id, reviewerAttestation);
+    }
 
     if (args.escrow_id) {
       this.escrowVerificationResults.set(args.escrow_id, result);
     }
+    this.persistServerState();
 
     this.audit.record('contract_verified', {
       contractName: args.contract_name,
@@ -1307,19 +1671,12 @@ export class AgentMCPServer {
       tier: args.verification_tier,
       status,
       evidenceRef,
-      outputContractRef: args.output_contract_ref ?? args.output_contract?.contract_id,
+      attestationId: attestation.attestation_id,
+      outputContractRef: args.output_contract_ref ?? trustedOutputContract?.contract.contract_id,
+      outputContractHash,
     });
 
     return result;
-  }
-
-  private async isReadablePath(candidate: string): Promise<boolean> {
-    try {
-      await access(candidate);
-      return true;
-    } catch {
-      return false;
-    }
   }
 
   private assertSupportedSpecVersion(specVersion: unknown): void {
@@ -1349,7 +1706,12 @@ export class AgentMCPServer {
     escrowId: string,
     completionEvidence?: string,
     manualReviewRef?: string,
+    actorAgentId?: string,
   ) {
+    if (actorAgentId) {
+      this.assertEscrowRole(escrowId, actorAgentId, ['buyer', 'arbitrator']);
+    }
+
     const requirement = this.escrowVerificationRequirements.get(escrowId);
 
     if (requirement) {
@@ -1368,6 +1730,36 @@ export class AgentMCPServer {
         throw new Error(
           `Escrow ${escrowId} cannot be released: verification status '${result.status}' is not settlement-eligible`,
         );
+      }
+      if (requirement.outputContractHash && result.output_contract_hash !== requirement.outputContractHash) {
+        throw new Error(
+          `Escrow ${escrowId} cannot be released: verification result is bound to output contract hash '${result.output_contract_hash ?? 'missing'}' not '${requirement.outputContractHash}'`,
+        );
+      }
+      if (!result.attestation) {
+        throw new Error(`Escrow ${escrowId} cannot be released: no signed verification attestation recorded`);
+      }
+      const attestationPublicKey = this.resolveAttestationPublicKey(
+        result.attestation.verifier_id,
+        result.attestation.key_id,
+      );
+      if (!attestationPublicKey || !verifyVerificationAttestation(result.attestation, attestationPublicKey)) {
+        throw new Error(`Escrow ${escrowId} cannot be released: verification attestation signature is invalid`);
+      }
+      if (result.attestation.payload.subject !== result.subject) {
+        throw new Error(`Escrow ${escrowId} cannot be released: attestation subject does not match recorded verification subject`);
+      }
+      if (result.attestation.payload.tier !== result.tier) {
+        throw new Error(`Escrow ${escrowId} cannot be released: attestation tier does not match recorded verification tier`);
+      }
+      if (result.attestation.payload.status !== result.status) {
+        throw new Error(`Escrow ${escrowId} cannot be released: attestation status does not match recorded verification status`);
+      }
+      if (result.attestation.payload.evidence_ref !== result.evidence_ref) {
+        throw new Error(`Escrow ${escrowId} cannot be released: attestation evidence ref does not match recorded verification evidence`);
+      }
+      if ((result.attestation.payload.output_contract_hash ?? undefined) !== (result.output_contract_hash ?? undefined)) {
+        throw new Error(`Escrow ${escrowId} cannot be released: attestation output contract hash does not match recorded verification result`);
       }
       if (
         requirement.outputContractRef &&
@@ -1407,6 +1799,7 @@ export class AgentMCPServer {
     outputContract: OutputContractDocument,
     contractName: string,
     specVersion: string,
+    expectedHash?: string,
   ): void {
     if (!outputContract || typeof outputContract !== 'object') {
       throw new Error('output_contract must be an object');
@@ -1418,6 +1811,9 @@ export class AgentMCPServer {
       throw new Error(
         `output_contract name '${outputContract.name}' does not match contract_name '${contractName}'`,
       );
+    }
+    if (expectedHash && hashOutputContract(outputContract) !== expectedHash) {
+      throw new Error(`output_contract content hash does not match trusted hash '${expectedHash}'`);
     }
   }
 
@@ -1432,6 +1828,68 @@ export class AgentMCPServer {
       return ['proven'];
     }
     return ['validated'];
+  }
+
+  private resolveTrustedOutputContract(contractRef: string): TrustedOutputContractRecord {
+    const record = this.trustedOutputContracts.get(contractRef);
+    if (!record) {
+      throw new Error(`Trusted output contract '${contractRef}' is not registered`);
+    }
+    return record;
+  }
+
+  private resolveAgentPublicKey(agentId: string, keyId: string): string | undefined {
+    const entry = this.agentRegistry.get(agentId);
+    return entry?.agentCard.auth.signing_keys.find((key) => key.key_id === keyId)?.public_key_pem;
+  }
+
+  private resolveAttestationPublicKey(verifierId: string, keyId: string): string | undefined {
+    if (verifierId === this.verificationWorker.verifierId && keyId === this.verificationWorker.keyId) {
+      return this.verificationWorker.publicKeyPem;
+    }
+    return this.resolveAgentPublicKey(verifierId, keyId);
+  }
+
+  private assertEscrowRole(
+    escrowId: string,
+    actorAgentId: string,
+    allowedRoles: Array<'buyer' | 'beneficiary' | 'arbitrator'>,
+  ): void {
+    const escrow = this.economic.getExtendedEscrow(escrowId);
+    if (!escrow) {
+      throw new Error(`Escrow not found: ${escrowId}`);
+    }
+
+    const allowed = allowedRoles.some((role) => {
+      if (role === 'buyer') {
+        return escrow.buyerAgentId === actorAgentId;
+      }
+      if (role === 'beneficiary') {
+        return escrow.beneficiaryAgentId === actorAgentId;
+      }
+      return escrow.arbitrationAgentId === actorAgentId;
+    });
+
+    if (!allowed) {
+      throw new Error(`Agent '${actorAgentId}' is not authorized for escrow '${escrowId}' as one of [${allowedRoles.join(', ')}]`);
+    }
+  }
+
+  private assertDisputeRole(escrowId: string, actorAgentId: string): void {
+    this.assertEscrowRole(escrowId, actorAgentId, ['buyer', 'beneficiary', 'arbitrator']);
+  }
+
+  private assertVerificationRole(escrowId: string, actorAgentId: string): void {
+    try {
+      this.assertEscrowRole(escrowId, actorAgentId, ['buyer', 'beneficiary', 'arbitrator']);
+      return;
+    } catch {
+      const entry = this.agentRegistry.get(actorAgentId);
+      if (entry && ['formalVerification', 'governanceAudit'].includes(entry.agentCard.capability)) {
+        return;
+      }
+      throw new Error(`Agent '${actorAgentId}' is not allowed to request escrow-bound verification for '${escrowId}'`);
+    }
   }
 
   // ----------------------------------------------------------

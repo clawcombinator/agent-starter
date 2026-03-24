@@ -24,7 +24,7 @@ export class CCAPComposition {
   constructor(
     private readonly economic: CCAPEconomic,
     private readonly audit: AuditLogger,
-    private readonly registryUrl: string = 'https://api.clawcombinator.ai/v1',
+    private readonly registryUrl: string = 'https://api.clawcombinator.ai',
     private readonly ccApiKey: string = process.env['CC_API_KEY'] ?? '',
   ) {}
 

@@ -18,6 +18,7 @@ import crypto from 'node:crypto';
 import type { AuditLogger } from '../audit.js';
 import type { SafetyMonitor } from '../safety.js';
 import type { PaymentRouter } from '../router.js';
+import { DurableStateStore } from '../state-store.js';
 import type {
   Balance,
   PaymentResult,
@@ -38,6 +39,7 @@ import type {
   CreateEscrowResult,
   DisputeRecord,
   EscrowParams,
+  EscrowHoldingRecord,
   EscrowRecord,
   EscrowResult,
   EscrowStatusResult,
@@ -54,24 +56,41 @@ import type {
   VerifyBondResult,
 } from '../types.js';
 
-// In-memory stores — replace with durable storage for production
-const invoiceStore = new Map<string, InvoiceResult & InvoiceParams>();
-const escrowStore = new Map<string, EscrowRecord>();
-const extendedEscrowStore = new Map<string, ExtendedEscrowRecord>();
-const bondStore = new Map<string, BondRecord>();
-const disputeStore = new Map<string, DisputeRecord>();
 const MAX_TIMEOUT_MS = 2_147_483_647;
-// creditScoreStore is keyed by agent_id. In production this would be
-// populated from the CCAP registry. Here we seed a minimal computed score.
-const creditScoreStore = new Map<string, CreditScore>();
 
 export class CCAPEconomic {
+  private readonly stateStore: DurableStateStore;
+  private readonly escrowHoldingAccount: string;
+  private readonly invoiceStore: Map<string, InvoiceResult & InvoiceParams>;
+  private readonly escrowStore: Map<string, EscrowRecord>;
+  private readonly extendedEscrowStore: Map<string, ExtendedEscrowRecord>;
+  private readonly bondStore: Map<string, BondRecord>;
+  private readonly disputeStore: Map<string, DisputeRecord>;
+  private readonly creditScoreStore: Map<string, CreditScore>;
+  private readonly escrowHoldingStore: Map<string, EscrowHoldingRecord>;
+
   constructor(
     private readonly router: PaymentRouter,
     private readonly safety: SafetyMonitor,
     private readonly audit: AuditLogger,
-    readonly ccApiUrl: string = 'https://api.clawcombinator.ai/v1',
-  ) {}
+    readonly ccApiUrl: string = 'https://api.clawcombinator.ai',
+    stateStore: DurableStateStore = new DurableStateStore(
+      process.env['CC_RUNTIME_STATE_PATH'] ?? './data/ccap-runtime-state.json',
+    ),
+    escrowHoldingAccount: string = process.env['CC_ESCROW_HOLDING_ACCOUNT'] ?? 'ccap_escrow_holding_v1',
+  ) {
+    this.stateStore = stateStore;
+    this.escrowHoldingAccount = escrowHoldingAccount;
+
+    const persisted = this.stateStore.read();
+    this.invoiceStore = new Map(Object.entries(persisted.invoices));
+    this.escrowStore = new Map(Object.entries(persisted.escrows));
+    this.extendedEscrowStore = new Map(Object.entries(persisted.extendedEscrows));
+    this.bondStore = new Map(Object.entries(persisted.bonds));
+    this.disputeStore = new Map(Object.entries(persisted.disputes));
+    this.creditScoreStore = new Map(Object.entries(persisted.creditScores));
+    this.escrowHoldingStore = new Map(Object.entries(persisted.escrowHoldings));
+  }
 
   // ----------------------------------------------------------
   // invoice — create a structured payment request
@@ -93,7 +112,8 @@ export class CCAPEconomic {
       currency: params.currency,
     };
 
-    invoiceStore.set(invoiceId, { ...params, ...result });
+    this.invoiceStore.set(invoiceId, { ...params, ...result });
+    this.persistRuntimeState();
 
     this.audit.record('invoice_created', {
       invoiceId,
@@ -150,9 +170,10 @@ export class CCAPEconomic {
 
     // Mark invoice as paid if one was referenced
     if (params.invoiceId) {
-      const inv = invoiceStore.get(params.invoiceId);
+      const inv = this.invoiceStore.get(params.invoiceId);
       if (inv) {
-        invoiceStore.set(params.invoiceId, { ...inv });
+        this.invoiceStore.set(params.invoiceId, { ...inv });
+        this.persistRuntimeState();
       }
     }
 
@@ -227,7 +248,8 @@ export class CCAPEconomic {
       createdAt: new Date().toISOString(),
     };
 
-    escrowStore.set(escrowId, record);
+    this.escrowStore.set(escrowId, record);
+    this.persistRuntimeState();
     this.safety.recordSpend(params.amount);
 
     this.audit.record('escrow_created', {
@@ -299,7 +321,8 @@ export class CCAPEconomic {
       idempotencyKey: params.idempotencyKey,
     };
 
-    extendedEscrowStore.set(escrowId, record);
+    this.extendedEscrowStore.set(escrowId, record);
+    this.persistRuntimeState();
     this.invalidateCreditScores([record.buyerAgentId, record.beneficiaryAgentId]);
 
     this.audit.record('extended_escrow_created', {
@@ -338,7 +361,7 @@ export class CCAPEconomic {
   // ----------------------------------------------------------
 
   async fundEscrow(escrowId: string, buyerAgentId?: string): Promise<FundEscrowResult> {
-    const record = extendedEscrowStore.get(escrowId);
+    const record = this.extendedEscrowStore.get(escrowId);
 
     if (!record) {
       throw new Error(`Escrow not found: ${escrowId}`);
@@ -359,12 +382,22 @@ export class CCAPEconomic {
     const fundedAt = new Date().toISOString();
     const nextBuyerAgentId = buyerAgentId ?? record.buyerAgentId;
 
-    extendedEscrowStore.set(escrowId, {
+    this.extendedEscrowStore.set(escrowId, {
       ...record,
       buyerAgentId: nextBuyerAgentId,
       status: 'funded',
       fundedAt,
     });
+    this.escrowHoldingStore.set(escrowId, {
+      escrowId,
+      holdingAccount: this.escrowHoldingAccount,
+      amount: record.amount,
+      currency: record.currency,
+      sourceTransactionId: payResult.transactionId,
+      fundedAt,
+      fundsState: 'held',
+    });
+    this.persistRuntimeState();
 
     this.invalidateCreditScores([nextBuyerAgentId, record.beneficiaryAgentId]);
 
@@ -398,7 +431,7 @@ export class CCAPEconomic {
   // ----------------------------------------------------------
 
   async verifyEscrow(escrowId: string): Promise<EscrowStatusResult> {
-    const record = extendedEscrowStore.get(escrowId);
+    const record = this.extendedEscrowStore.get(escrowId);
 
     if (!record) {
       throw new Error(`Escrow not found: ${escrowId}`);
@@ -428,7 +461,7 @@ export class CCAPEconomic {
   // ----------------------------------------------------------
 
   async releaseEscrow(escrowId: string, completionEvidence?: string): Promise<ReleaseEscrowResult> {
-    const record = extendedEscrowStore.get(escrowId);
+    const record = this.extendedEscrowStore.get(escrowId);
 
     if (!record) {
       throw new Error(`Escrow not found: ${escrowId}`);
@@ -438,22 +471,35 @@ export class CCAPEconomic {
       throw new Error(`Escrow ${escrowId} cannot be released: status is '${record.status}'`);
     }
 
+    const holding = this.escrowHoldingStore.get(escrowId);
+    if (!holding || holding.fundsState !== 'held') {
+      throw new Error(`Escrow ${escrowId} cannot be released: held funds are missing or already reconciled`);
+    }
+
     // Route the payment to the beneficiary via the PaymentRouter
     const payResult = await this.router.route({
       amount: record.amount,
       currency: record.currency,
       recipient: record.beneficiaryAgentId,
-      memo: `Escrow release: ${escrowId}`,
+      memo: `Escrow release from ${this.escrowHoldingAccount}: ${escrowId}`,
+      idempotencyKey: `escrow_release_${escrowId}`,
     });
 
     const releasedAt = new Date().toISOString();
 
-    extendedEscrowStore.set(escrowId, {
+    this.extendedEscrowStore.set(escrowId, {
       ...record,
       status: 'released',
       releasedAt,
       completionEvidence,
     });
+    this.escrowHoldingStore.set(escrowId, {
+      ...holding,
+      fundsState: 'released',
+      releaseTransactionId: payResult.transactionId,
+      releasedAt,
+    });
+    this.persistRuntimeState();
     this.invalidateCreditScores([record.buyerAgentId, record.beneficiaryAgentId]);
 
     this.audit.record('extended_escrow_released', {
@@ -479,19 +525,24 @@ export class CCAPEconomic {
   // ----------------------------------------------------------
   // refundEscrow — returns funds to the buyer
   //
-  // Only valid when status is 'created' or 'funded'.
+  // Only valid when status is 'funded' or 'disputed'.
   // On timeout, expireExtendedEscrow() calls this automatically.
   // ----------------------------------------------------------
 
   async refundEscrow(escrowId: string, reason?: string): Promise<RefundEscrowResult> {
-    const record = extendedEscrowStore.get(escrowId);
+    const record = this.extendedEscrowStore.get(escrowId);
 
     if (!record) {
       throw new Error(`Escrow not found: ${escrowId}`);
     }
 
-    if (record.status !== 'created' && record.status !== 'funded') {
+    if (record.status !== 'funded' && record.status !== 'disputed') {
       throw new Error(`Escrow ${escrowId} cannot be refunded: status is '${record.status}'`);
+    }
+
+    const holding = this.escrowHoldingStore.get(escrowId);
+    if (!holding || holding.fundsState !== 'held') {
+      throw new Error(`Escrow ${escrowId} cannot be refunded: held funds are missing or already reconciled`);
     }
 
     // Route the payment back to the buyer. In production the buyer wallet
@@ -501,16 +552,24 @@ export class CCAPEconomic {
       amount: record.amount,
       currency: record.currency,
       recipient: record.buyerAgentId,
-      memo: `Escrow refund: ${escrowId}${reason ? ` — ${reason}` : ''}`,
+      memo: `Escrow refund from ${this.escrowHoldingAccount}: ${escrowId}${reason ? ` — ${reason}` : ''}`,
+      idempotencyKey: `escrow_refund_${escrowId}`,
     });
 
     const refundedAt = new Date().toISOString();
 
-    extendedEscrowStore.set(escrowId, {
+    this.extendedEscrowStore.set(escrowId, {
       ...record,
       status: 'refunded',
       refundedAt,
     });
+    this.escrowHoldingStore.set(escrowId, {
+      ...holding,
+      fundsState: 'refunded',
+      refundTransactionId: payResult.transactionId,
+      refundedAt,
+    });
+    this.persistRuntimeState();
     this.invalidateCreditScores([record.buyerAgentId, record.beneficiaryAgentId]);
 
     this.audit.record('extended_escrow_refunded', {
@@ -583,7 +642,8 @@ export class CCAPEconomic {
       idempotencyKey: params.idempotencyKey,
     };
 
-    bondStore.set(bondId, record);
+    this.bondStore.set(bondId, record);
+    this.persistRuntimeState();
     this.invalidateCreditScores([record.agentId]);
 
     this.audit.record('bond_posted', {
@@ -624,7 +684,7 @@ export class CCAPEconomic {
   // ----------------------------------------------------------
 
   verifyBond(agentId: string, scope?: BondScope): VerifyBondResult {
-    const activeBonds = Array.from(bondStore.values()).filter(
+    const activeBonds = Array.from(this.bondStore.values()).filter(
       (b) =>
         b.agentId === agentId &&
         b.status === 'active' &&
@@ -657,7 +717,7 @@ export class CCAPEconomic {
       scope: best.scope,
       expiresAt: best.expiresAt,
       claimsHistory: {
-        totalPeriods: bondStore.size,
+        totalPeriods: this.bondStore.size,
         claimsFiled: best.claimsHistory.length,
         claimsUpheld: best.claimsHistory.filter((c) => c.status === 'upheld').length,
       },
@@ -672,7 +732,7 @@ export class CCAPEconomic {
   // ----------------------------------------------------------
 
   async claimBond(params: ClaimBondParams): Promise<ClaimBondResult> {
-    const bond = bondStore.get(params.bondId);
+    const bond = this.bondStore.get(params.bondId);
 
     if (!bond) {
       throw new Error(`Bond not found: ${params.bondId}`);
@@ -703,10 +763,11 @@ export class CCAPEconomic {
       filedAt,
     };
 
-    bondStore.set(params.bondId, {
+    this.bondStore.set(params.bondId, {
       ...bond,
       claimsHistory: [...bond.claimsHistory, claimRecord],
     });
+    this.persistRuntimeState();
     this.invalidateCreditScores([bond.agentId, params.claimedBy]);
 
     this.audit.record('bond_claim_filed', {
@@ -735,13 +796,13 @@ export class CCAPEconomic {
   // ----------------------------------------------------------
 
   async openDispute(params: OpenDisputeParams): Promise<OpenDisputeResult> {
-    const record = extendedEscrowStore.get(params.escrowId);
+    const record = this.extendedEscrowStore.get(params.escrowId);
 
     if (!record) {
       throw new Error(`Escrow not found: ${params.escrowId}`);
     }
 
-    if (record.status === 'refunded' || record.status === 'expired') {
+    if (record.status !== 'funded') {
       throw new Error(`Escrow ${params.escrowId} cannot be disputed from status '${record.status}'`);
     }
 
@@ -749,7 +810,7 @@ export class CCAPEconomic {
     const openedAt = new Date().toISOString();
     const evidenceRefs = params.evidenceRefs ?? [];
 
-    extendedEscrowStore.set(params.escrowId, {
+    this.extendedEscrowStore.set(params.escrowId, {
       ...record,
       status: 'disputed',
       disputeId,
@@ -768,7 +829,8 @@ export class CCAPEconomic {
       specVersion: '0.1.0',
     };
 
-    disputeStore.set(disputeId, dispute);
+    this.disputeStore.set(disputeId, dispute);
+    this.persistRuntimeState();
     this.invalidateCreditScores([record.buyerAgentId, record.beneficiaryAgentId, params.claimantAgentId]);
 
     this.audit.record('escrow_dispute_opened', {
@@ -803,15 +865,15 @@ export class CCAPEconomic {
 
   getCreditScore(agentId: string): CreditScore {
     // Return a cached score if available
-    const cached = creditScoreStore.get(agentId);
+    const cached = this.creditScoreStore.get(agentId);
     if (cached) {
       this.audit.record('credit_score_queried', { agentId, score: cached.score });
       return cached;
     }
 
     // Derive a basic score from the in-memory bond and escrow history
-    const agentBonds = Array.from(bondStore.values()).filter((bond) => bond.agentId === agentId);
-    const agentEscrows = Array.from(extendedEscrowStore.values()).filter(
+    const agentBonds = Array.from(this.bondStore.values()).filter((bond) => bond.agentId === agentId);
+    const agentEscrows = Array.from(this.extendedEscrowStore.values()).filter(
       (escrow) =>
         escrow.beneficiaryAgentId === agentId ||
         escrow.buyerAgentId === agentId,
@@ -903,7 +965,8 @@ export class CCAPEconomic {
       }] : [],
     };
 
-    creditScoreStore.set(agentId, score);
+    this.creditScoreStore.set(agentId, score);
+    this.persistRuntimeState();
 
     this.audit.record('credit_score_computed', { agentId, score: composite, tier });
 
@@ -915,27 +978,31 @@ export class CCAPEconomic {
   // ----------------------------------------------------------
 
   getInvoice(invoiceId: string): (InvoiceResult & InvoiceParams) | undefined {
-    return invoiceStore.get(invoiceId);
+    return this.invoiceStore.get(invoiceId);
   }
 
   getEscrow(escrowId: string): EscrowRecord | undefined {
-    return escrowStore.get(escrowId);
+    return this.escrowStore.get(escrowId);
   }
 
   getExtendedEscrow(escrowId: string): ExtendedEscrowRecord | undefined {
-    return extendedEscrowStore.get(escrowId);
+    return this.extendedEscrowStore.get(escrowId);
+  }
+
+  getEscrowHolding(escrowId: string): EscrowHoldingRecord | undefined {
+    return this.escrowHoldingStore.get(escrowId);
   }
 
   getBond(bondId: string): BondRecord | undefined {
-    return bondStore.get(bondId);
+    return this.bondStore.get(bondId);
   }
 
   getDispute(disputeId: string): DisputeRecord | undefined {
-    return disputeStore.get(disputeId);
+    return this.disputeStore.get(disputeId);
   }
 
   listBonds(agentId?: string): BondRecord[] {
-    const bonds = Array.from(bondStore.values());
+    const bonds = Array.from(this.bondStore.values());
     if (!agentId) {
       return bonds;
     }
@@ -943,16 +1010,17 @@ export class CCAPEconomic {
   }
 
   private async expireEscrow(escrowId: string): Promise<void> {
-    const record = escrowStore.get(escrowId);
+    const record = this.escrowStore.get(escrowId);
     if (!record || record.status !== 'locked') return;
 
-    escrowStore.set(escrowId, { ...record, status: 'expired' });
+    this.escrowStore.set(escrowId, { ...record, status: 'expired' });
+    this.persistRuntimeState();
     this.audit.record('escrow_expired', { escrowId });
     // In production, release locked funds back to the originating wallet here
   }
 
   private async expireExtendedEscrow(escrowId: string): Promise<void> {
-    const record = extendedEscrowStore.get(escrowId);
+    const record = this.extendedEscrowStore.get(escrowId);
     if (!record || (record.status !== 'created' && record.status !== 'funded')) return;
 
     if (record.status === 'funded') {
@@ -960,14 +1028,15 @@ export class CCAPEconomic {
       return;
     }
 
-    extendedEscrowStore.set(escrowId, { ...record, status: 'expired' });
+    this.extendedEscrowStore.set(escrowId, { ...record, status: 'expired' });
+    this.persistRuntimeState();
     this.invalidateCreditScores([record.buyerAgentId, record.beneficiaryAgentId]);
     this.audit.record('extended_escrow_expired', { escrowId });
     // In production, trigger a refund back to the buyer wallet
   }
 
   private async releaseBondOnExpiry(bondId: string): Promise<void> {
-    const bond = bondStore.get(bondId);
+    const bond = this.bondStore.get(bondId);
     if (!bond || bond.status !== 'active') return;
 
     const hasUnresolvedClaims = bond.claimsHistory.some((c) => c.status === 'under_review');
@@ -977,7 +1046,8 @@ export class CCAPEconomic {
       return;
     }
 
-    bondStore.set(bondId, { ...bond, status: 'released' });
+    this.bondStore.set(bondId, { ...bond, status: 'released' });
+    this.persistRuntimeState();
     this.invalidateCreditScores([bond.agentId]);
     this.audit.record('bond_released', {
       bondId,
@@ -1024,9 +1094,22 @@ export class CCAPEconomic {
   private invalidateCreditScores(agentIds: string[]): void {
     for (const agentId of agentIds) {
       if (agentId) {
-        creditScoreStore.delete(agentId);
+        this.creditScoreStore.delete(agentId);
       }
     }
+    this.persistRuntimeState();
+  }
+
+  private persistRuntimeState(): void {
+    this.stateStore.transaction((draft) => {
+      draft.invoices = Object.fromEntries(this.invoiceStore);
+      draft.escrows = Object.fromEntries(this.escrowStore);
+      draft.extendedEscrows = Object.fromEntries(this.extendedEscrowStore);
+      draft.bonds = Object.fromEntries(this.bondStore);
+      draft.disputes = Object.fromEntries(this.disputeStore);
+      draft.creditScores = Object.fromEntries(this.creditScoreStore);
+      draft.escrowHoldings = Object.fromEntries(this.escrowHoldingStore);
+    });
   }
 }
 

@@ -3,7 +3,7 @@
 // export, and multi-entry verification.
 // ============================================================
 
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -21,6 +21,10 @@ describe('AuditLogger', () => {
   beforeEach(() => {
     logPath = tempLogPath();
     audit = new AuditLogger(logPath);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   // ----------------------------------------------------------
@@ -48,6 +52,40 @@ describe('AuditLogger', () => {
     audit.record('disk_test', { val: 42 });
     const raw = fs.readFileSync(logPath, 'utf8');
     expect(raw).toContain('disk_test');
+  });
+
+  it('writes anchor entries alongside the main audit log', () => {
+    const entry = audit.record('anchor_test', { val: 7 });
+    const anchorPath = logPath.replace(/\.jsonl$/, '.anchors.jsonl');
+    const anchors = fs.readFileSync(anchorPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+
+    expect(anchors).toHaveLength(1);
+    expect(anchors[0]!.auditEntryId).toBe(entry.id);
+    expect(anchors[0]!.rootHash).toBe(entry.hash);
+    expect(anchors[0]!.logPath).toBe(logPath);
+  });
+
+  it('ships anchor entries to the immutable sink when configured', () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      status: 202,
+      json: async () => ({}),
+      text: async () => '',
+    } as unknown as Response);
+    const anchoredAudit = new AuditLogger(logPath, {
+      immutableSinkUrl: 'https://audit.example.test/anchors',
+    });
+
+    anchoredAudit.record('ship_anchor', { ok: true });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledWith(
+      'https://audit.example.test/anchors',
+      expect.objectContaining({
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
   });
 
   // ----------------------------------------------------------

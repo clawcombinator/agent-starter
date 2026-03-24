@@ -72,7 +72,7 @@ async function main(): Promise<void> {
   console.log(`  ╚██████╗╚██████╗    ██║  ██║██║  ██║`);
   console.log(`   ╚═════╝ ╚═════╝    ╚═╝  ╚═╝╚═╝  ╚═╝`);
   console.log(`${C.reset}`);
-  console.log(`${C.yellow}  ClawCombinator — OpenRouter for Agent Payments${C.reset}`);
+  console.log(`${C.yellow}  ClawCombinator — The Clearing House for Agent Payments${C.reset}`);
   console.log(`${C.dim}  LAUNCH Festival Demo · March 16–17, 2026${C.reset}`);
   console.log();
   console.log(`${C.dim}  Scenario: AI law firm (Buyer) hires AI compliance specialist (Seller)${C.reset}`);

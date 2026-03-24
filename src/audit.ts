@@ -14,13 +14,30 @@ import type { AuditEntry, AuditVerifyResult } from './types.js';
 
 const GENESIS_HASH = '0000000000000000000000000000000000000000000000000000000000000000';
 
+export interface AuditLoggerOptions {
+  anchorPath?: string;
+  immutableSinkUrl?: string;
+}
+
+interface AuditAnchorEntry {
+  auditEntryId: string;
+  timestamp: string;
+  rootHash: string;
+  previousHash: string;
+  logPath: string;
+}
+
 export class AuditLogger {
   private entries: AuditEntry[] = [];
   private logPath: string;
   private lastHash: string = GENESIS_HASH;
+  private readonly anchorPath: string;
+  private readonly immutableSinkUrl?: string;
 
-  constructor(logPath: string = './logs/audit.jsonl') {
+  constructor(logPath: string = './logs/audit.jsonl', options: AuditLoggerOptions = {}) {
     this.logPath = logPath;
+    this.anchorPath = options.anchorPath ?? defaultAnchorPath(logPath);
+    this.immutableSinkUrl = options.immutableSinkUrl;
     this.ensureLogDirectory();
     this.loadExisting();
   }
@@ -52,6 +69,7 @@ export class AuditLogger {
     this.entries.push(entry);
     this.lastHash = hash;
     this.appendToDisk(entry);
+    this.appendAnchor(entry);
 
     return entry;
   }
@@ -137,6 +155,10 @@ export class AuditLogger {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
+    const anchorDir = path.dirname(this.anchorPath);
+    if (!fs.existsSync(anchorDir)) {
+      fs.mkdirSync(anchorDir, { recursive: true });
+    }
   }
 
   private loadExisting(): void {
@@ -164,4 +186,37 @@ export class AuditLogger {
       process.stderr.write(`[AuditLogger] Failed to write to disk: ${String(err)}\n`);
     }
   }
+
+  private appendAnchor(entry: AuditEntry): void {
+    const anchor: AuditAnchorEntry = {
+      auditEntryId: entry.id,
+      timestamp: entry.timestamp,
+      rootHash: entry.hash,
+      previousHash: entry.previousHash,
+      logPath: this.logPath,
+    };
+
+    try {
+      fs.appendFileSync(this.anchorPath, JSON.stringify(anchor) + '\n', 'utf8');
+    } catch (err) {
+      process.stderr.write(`[AuditLogger] Failed to write audit anchor: ${String(err)}\n`);
+    }
+
+    if (this.immutableSinkUrl) {
+      void fetch(this.immutableSinkUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(anchor),
+      }).catch((err: unknown) => {
+        process.stderr.write(`[AuditLogger] Failed to ship audit anchor: ${String(err)}\n`);
+      });
+    }
+  }
+}
+
+function defaultAnchorPath(logPath: string): string {
+  if (logPath.endsWith('.jsonl')) {
+    return logPath.replace(/\.jsonl$/, '.anchors.jsonl');
+  }
+  return `${logPath}.anchors.jsonl`;
 }

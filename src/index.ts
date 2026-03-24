@@ -26,6 +26,8 @@ import { AgentMCPServer } from './mcp-server.js';
 import { CCAPEconomic } from './ccap/economic.js';
 import { CCAPComposition } from './ccap/compose.js';
 import { ExampleReviewCapability } from './capabilities/example-review.js';
+import { DurableStateStore } from './state-store.js';
+import { VerificationWorker } from './verifier.js';
 import type { HealthResponse, SafetyConfig } from './types.js';
 
 // ----------------------------------------------------------
@@ -48,9 +50,14 @@ const logger = winston.createLogger({
 
 async function bootstrap(): Promise<void> {
   const startTime = Date.now();
+  const auditLogPath = process.env['AUDIT_LOG_PATH'] ?? './logs/audit.jsonl';
+  const runtimeStatePath = process.env['CC_RUNTIME_STATE_PATH'] ?? './data/ccap-runtime-state.json';
 
   // 1. Audit log — initialised first so all subsequent actions are recorded
-  const audit = new AuditLogger(process.env['AUDIT_LOG_PATH'] ?? './logs/audit.jsonl');
+  const audit = new AuditLogger(auditLogPath, {
+    anchorPath: process.env['CC_AUDIT_ANCHOR_PATH'],
+    immutableSinkUrl: process.env['CC_AUDIT_IMMUTABLE_SINK_URL'],
+  });
   audit.record('agent_start', { agentId: process.env['CC_AGENT_ID'] ?? 'unknown' });
 
   // 2. Safety config from env (with sensible defaults for development)
@@ -75,6 +82,16 @@ async function bootstrap(): Promise<void> {
   };
 
   const safety = new SafetyMonitor(safetyConfig, audit);
+  const stateStore = new DurableStateStore(runtimeStatePath);
+  const verificationWorker = new VerificationWorker(
+    {
+      verifierId: process.env['CC_VERIFIER_ID'] ?? 'clawcombinator_platform_verifier_v1',
+      contractsDir: new URL('../contracts', import.meta.url).pathname,
+      verifierKeyPath: process.env['CC_VERIFIER_KEY_PATH'] ?? './data/verifier-keypair.json',
+      commandTimeoutMs: Number(process.env['CC_VERIFIER_COMMAND_TIMEOUT_MS'] ?? 600_000),
+    },
+    audit,
+  );
 
   // 3. Payment router — the central routing layer
   const router = new PaymentRouter(safety, audit);
@@ -137,19 +154,22 @@ async function bootstrap(): Promise<void> {
     logger.info('x402 provider skipped — X402_WALLET_ADDRESS or X402_PRIVATE_KEY not set');
   }
 
+  const ccApiBaseUrl = process.env['CC_API_URL'] ?? 'https://api.clawcombinator.ai';
+
   // 5. CCAP economic layer (router-backed)
   const economic = new CCAPEconomic(
     router,
     safety,
     audit,
-    process.env['CC_API_URL'] ?? 'https://api.clawcombinator.ai/v1',
+    ccApiBaseUrl,
+    stateStore,
   );
 
   // 6. CCAP composition layer (agent discovery and invocation)
   const composition = new CCAPComposition(
     economic,
     audit,
-    process.env['CC_API_URL'] ?? 'https://api.clawcombinator.ai/v1',
+    ccApiBaseUrl,
     process.env['CC_API_KEY'] ?? '',
   );
 
@@ -157,7 +177,7 @@ async function bootstrap(): Promise<void> {
   void composition;
 
   // 7. MCP server — register capabilities and economic tools
-  const mcpServer = new AgentMCPServer(safety, audit, economic, router);
+  const mcpServer = new AgentMCPServer(safety, audit, economic, router, stateStore, verificationWorker);
   mcpServer.registerCapability(new ExampleReviewCapability());
 
   // 8. Express HTTP server

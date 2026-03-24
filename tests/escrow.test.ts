@@ -19,6 +19,7 @@ import { AuditLogger } from '../src/audit.js';
 import { SafetyMonitor } from '../src/safety.js';
 import { PaymentRouter } from '../src/router.js';
 import { CCAPEconomic, SafetyViolationError } from '../src/ccap/economic.js';
+import { DurableStateStore } from '../src/state-store.js';
 import type { PaymentProvider, Balance, PaymentParams, PaymentResult } from '../src/providers/types.js';
 import type { SafetyConfig } from '../src/types.js';
 
@@ -28,6 +29,10 @@ import type { SafetyConfig } from '../src/types.js';
 
 function tempLogPath(): string {
   return path.join(os.tmpdir(), `escrow_test_${crypto.randomBytes(4).toString('hex')}.jsonl`);
+}
+
+function tempStatePath(): string {
+  return path.join(os.tmpdir(), `escrow_state_${crypto.randomBytes(4).toString('hex')}.json`);
 }
 
 function makeConfig(overrides: Partial<SafetyConfig['budget']> = {}): SafetyConfig {
@@ -85,7 +90,13 @@ describe('Extended Escrow and Trust primitives', () => {
     router = new PaymentRouter(safety, audit);
     provider = makeMockProvider();
     router.registerProvider(provider);
-    economic = new CCAPEconomic(router, safety, audit);
+    economic = new CCAPEconomic(
+      router,
+      safety,
+      audit,
+      'https://api.clawcombinator.ai',
+      new DurableStateStore(tempStatePath()),
+    );
   });
 
   // ----------------------------------------------------------
@@ -275,11 +286,13 @@ describe('Extended Escrow and Trust primitives', () => {
       const created = await economic.createEscrow({
         amount: 400,
         currency: 'USDC',
+        buyerAgentId: 'agent_buyer',
         beneficiaryAgentId: 'agent_seller',
         completionCriteria: 'Refund test',
         timeoutSeconds: 3600,
         disputeResolutionMethod: 'automatic',
       });
+      await economic.fundEscrow(created.escrowId, 'agent_buyer');
 
       const refunded = await economic.refundEscrow(
         created.escrowId,
@@ -291,37 +304,82 @@ describe('Extended Escrow and Trust primitives', () => {
       expect(refunded.amount).toBe(400);
       expect(refunded.refundedAt).toBeTruthy();
       expect(refunded.transactionId).toBeTruthy();
+      expect(economic.getEscrowHolding(created.escrowId)?.fundsState).toBe('refunded');
     });
 
     it('refundEscrow routes a payment back through the PaymentRouter', async () => {
       const created = await economic.createEscrow({
         amount: 150,
         currency: 'USDC',
+        buyerAgentId: 'agent_buyer',
         beneficiaryAgentId: 'agent_seller',
         completionCriteria: 'Refund router test',
         timeoutSeconds: 3600,
         disputeResolutionMethod: 'automatic',
       });
+      await economic.fundEscrow(created.escrowId, 'agent_buyer');
 
       await economic.refundEscrow(created.escrowId);
 
-      expect(provider.pay).toHaveBeenCalledOnce();
+      expect(provider.pay).toHaveBeenCalledTimes(2);
     });
 
     it('refundEscrow records extended_escrow_refunded in the audit log', async () => {
       const created = await economic.createEscrow({
         amount: 75,
         currency: 'USDC',
+        buyerAgentId: 'agent_buyer',
         beneficiaryAgentId: 'agent_seller',
         completionCriteria: 'Audit refund test',
         timeoutSeconds: 3600,
         disputeResolutionMethod: 'automatic',
       });
+      await economic.fundEscrow(created.escrowId, 'agent_buyer');
 
       await economic.refundEscrow(created.escrowId, 'Test refund reason');
 
       const entries = audit.export();
       expect(entries.some((e) => e.action === 'extended_escrow_refunded')).toBe(true);
+    });
+
+    it('refundEscrow throws when escrow has not been funded', async () => {
+      const created = await economic.createEscrow({
+        amount: 100,
+        currency: 'USDC',
+        buyerAgentId: 'agent_buyer',
+        beneficiaryAgentId: 'agent_seller',
+        completionCriteria: 'Created-only refund test',
+        timeoutSeconds: 3600,
+        disputeResolutionMethod: 'automatic',
+      });
+
+      await expect(
+        economic.refundEscrow(created.escrowId),
+      ).rejects.toThrow("cannot be refunded: status is 'created'");
+    });
+
+    it('refundEscrow returns held funds after a dispute is opened', async () => {
+      const created = await economic.createEscrow({
+        amount: 225,
+        currency: 'USDC',
+        buyerAgentId: 'agent_buyer',
+        beneficiaryAgentId: 'agent_seller',
+        completionCriteria: 'Disputed refund test',
+        timeoutSeconds: 3600,
+        disputeResolutionMethod: 'arbitration_agent',
+        arbitrationAgentId: 'agent_arbiter',
+      });
+      await economic.fundEscrow(created.escrowId, 'agent_buyer');
+      await economic.openDispute({
+        escrowId: created.escrowId,
+        claimantAgentId: 'agent_buyer',
+        reason: 'Scope mismatch',
+      });
+
+      const refunded = await economic.refundEscrow(created.escrowId, 'Arbitrator refund');
+
+      expect(refunded.status).toBe('refunded');
+      expect(economic.getEscrowHolding(created.escrowId)?.fundsState).toBe('refunded');
     });
 
     it('refundEscrow throws when escrow has already been released', async () => {
@@ -347,6 +405,8 @@ describe('Extended Escrow and Trust primitives', () => {
         router,
         new SafetyMonitor(makeConfig({ transactionLimitUsd: 100 }), audit),
         audit,
+        'https://api.clawcombinator.ai',
+        new DurableStateStore(tempStatePath()),
       );
 
       await expect(

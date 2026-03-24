@@ -9,6 +9,19 @@ import {
   FIRST_PARTY_OPERATOR_WORKFLOW_CLASS,
 } from './operator-intake.js';
 
+function buildExampleAuth(keysetId: string, keyId: string, publicKeyPem: string): AgentCardDocument['auth'] {
+  return {
+    keyset_id: keysetId,
+    signing_keys: [
+      {
+        key_id: keyId,
+        algorithm: 'ed25519',
+        public_key_pem: publicKeyPem,
+      },
+    ],
+  };
+}
+
 export const LEGAL_DUE_DILIGENCE_AGENT_CARD: AgentCardDocument = {
   agent_id: 'lex_duediligence_v2',
   capability: 'governanceAudit',
@@ -17,6 +30,13 @@ export const LEGAL_DUE_DILIGENCE_AGENT_CARD: AgentCardDocument = {
   bond_capacity_usd_cents: 50000,
   supports_mcp: true,
   supports_a2a: true,
+  auth: buildExampleAuth(
+    'example_lex_duediligence_keys_v1',
+    'lex_duediligence_ed25519_v1',
+    '-----BEGIN PUBLIC KEY-----\n'
+      + 'MCowBQYDK2VwAyEAbE5XX1d7PgUyNGirIyuB0Unjo0ZMI3IVsQ3lWOupjmo=\n'
+      + '-----END PUBLIC KEY-----\n',
+  ),
   contract: {
     name: 'legal_due_diligence_brief',
     input_type: 'intent',
@@ -37,6 +57,13 @@ export const FINANCIAL_SCENARIO_AGENT_CARD: AgentCardDocument = {
   bond_capacity_usd_cents: 150000,
   supports_mcp: true,
   supports_a2a: true,
+  auth: buildExampleAuth(
+    'example_financial_scenario_keys_v1',
+    'financial_scenario_ed25519_v1',
+    '-----BEGIN PUBLIC KEY-----\n'
+      + 'MCowBQYDK2VwAyEAPd9my0aWGDeAo1DcCaByMw5kDt8SQvFaG4Tqt+t+ngs=\n'
+      + '-----END PUBLIC KEY-----\n',
+  ),
   contract: {
     name: 'financial_scenario_analysis',
     input_type: 'productSpec',
@@ -162,6 +189,13 @@ export const CLAWCOMBINATOR_RELAY_OPERATOR_AGENT_CARD: AgentCardDocument = {
   bond_capacity_usd_cents: 0,
   supports_mcp: true,
   supports_a2a: true,
+  auth: buildExampleAuth(
+    'example_clawcombinator_relay_keys_v1',
+    'clawcombinator_relay_ed25519_v1',
+    '-----BEGIN PUBLIC KEY-----\n'
+      + 'MCowBQYDK2VwAyEAvQE43Ov2T0kKBzVhdmFfNrOM2gtSH3dU7nL5p7pN3jQ=\n'
+      + '-----END PUBLIC KEY-----\n',
+  ),
   contract: {
     name: 'clawcombinator_inbound_triage',
     input_type: 'intent',

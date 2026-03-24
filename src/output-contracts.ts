@@ -1,4 +1,3 @@
-import crypto from 'node:crypto';
 import { Ajv, type ErrorObject } from 'ajv';
 import addFormats from 'ajv-formats';
 import type {
@@ -6,6 +5,7 @@ import type {
   OutputContractValidationResult,
   VerificationStatus,
 } from './types.js';
+import { sha256Hex } from './canonical-json.js';
 
 const ajv = new Ajv({
   allErrors: true,
@@ -36,13 +36,28 @@ export function buildEvidenceRef(
   contract: Pick<OutputContractDocument, 'contract_id' | 'spec_version'>,
   payload: unknown,
 ): string {
-  const material = stableStringify({
+  const material = {
     contract_id: contract.contract_id,
     spec_version: contract.spec_version,
     payload,
-  });
+  };
 
-  return `sha256:${crypto.createHash('sha256').update(material).digest('hex')}`;
+  return `sha256:${sha256Hex(material)}`;
+}
+
+export function hashOutputContract(contract: OutputContractDocument): string {
+  return sha256Hex({
+    contract_id: contract.contract_id,
+    name: contract.name,
+    spec_version: contract.spec_version,
+    workflow_class: contract.workflow_class,
+    input_type: contract.input_type,
+    output_type: contract.output_type,
+    verification_tier: contract.verification_tier,
+    deliverable_schema: contract.deliverable_schema,
+    settlement_rules: contract.settlement_rules,
+    example_subject_ref: contract.example_subject_ref ?? null,
+  });
 }
 
 export function settlementStatusAllowed(
@@ -60,20 +75,4 @@ function formatErrors(errors: ErrorObject[]): string[] {
     }
     return `${path} validation failed`;
   });
-}
-
-function stableStringify(value: unknown): string {
-  if (value === null || typeof value !== 'object') {
-    return JSON.stringify(value);
-  }
-
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => stableStringify(item)).join(',')}]`;
-  }
-
-  const record = value as Record<string, unknown>;
-  const pairs = Object.keys(record)
-    .sort()
-    .map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`);
-  return `{${pairs.join(',')}}`;
 }

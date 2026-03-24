@@ -377,6 +377,49 @@ export interface ContractVerifyResult {
   status: VerificationStatus;
   evidence_ref: string;
   reviewer: string;
+  verified_at?: string;
+  output_contract_hash?: string;
+  attestation?: SignedVerificationAttestation;
+  quorum_attestations?: SignedVerificationAttestation[];
+}
+
+export interface SigningKeyDocument {
+  key_id: string;
+  algorithm: 'ed25519';
+  public_key_pem: string;
+}
+
+export interface AgentAuthDocument {
+  keyset_id: string;
+  signing_keys: SigningKeyDocument[];
+}
+
+export interface RequestAuthEnvelope {
+  agent_id: string;
+  key_id: string;
+  signed_at: string;
+  signature: string;
+}
+
+export interface VerificationAttestationPayload {
+  subject: string;
+  tier: VerificationTier;
+  status: VerificationStatus;
+  evidence_ref: string;
+  verification_method: 'lean_proof' | 'structured_output' | 'quorum_review';
+  runner_ref: string;
+  output_contract_ref?: string;
+  output_contract_hash?: string;
+}
+
+export interface SignedVerificationAttestation {
+  attestation_id: string;
+  verifier_id: string;
+  key_id: string;
+  algorithm: 'ed25519';
+  signed_at: string;
+  payload: VerificationAttestationPayload;
+  signature: string;
 }
 
 export interface AgentCardDocument {
@@ -395,6 +438,7 @@ export interface AgentCardDocument {
   bond_capacity_usd_cents: number;
   supports_mcp: boolean;
   supports_a2a: boolean;
+  auth: AgentAuthDocument;
   contract: {
     name: string;
     input_type:
@@ -477,6 +521,20 @@ export interface OutputContractDocument {
     required_verification_statuses: VerificationStatus[];
   };
   example_subject_ref?: string;
+}
+
+export interface EscrowHoldingRecord {
+  escrowId: string;
+  holdingAccount: string;
+  amount: number;
+  currency: string;
+  sourceTransactionId: string;
+  fundedAt: string;
+  fundsState: 'held' | 'released' | 'refunded';
+  releaseTransactionId?: string;
+  refundTransactionId?: string;
+  releasedAt?: string;
+  refundedAt?: string;
 }
 
 export interface OutputContractValidationResult {
