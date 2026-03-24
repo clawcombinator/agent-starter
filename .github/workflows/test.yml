@@ -1,0 +1,53 @@
+name: Test
+
+on:
+  push:
+    paths:
+      - ".github/workflows/test.yml"
+      - "demo/**"
+      - "governance/**"
+      - "package.json"
+      - "package-lock.json"
+      - "README.md"
+      - "scripts/**"
+      - "src/**"
+      - "tests/**"
+      - "tsconfig.json"
+      - "workflows/**"
+  pull_request:
+    paths:
+      - ".github/workflows/test.yml"
+      - "demo/**"
+      - "governance/**"
+      - "package.json"
+      - "package-lock.json"
+      - "README.md"
+      - "scripts/**"
+      - "src/**"
+      - "tests/**"
+      - "tsconfig.json"
+      - "workflows/**"
+
+jobs:
+  typescript:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run lint
+
+      - name: Test
+        run: npm test

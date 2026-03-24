@@ -1,0 +1,47 @@
+name: Lean
+
+on:
+  push:
+    paths:
+      - ".github/workflows/lean.yml"
+      - "contracts/**"
+      - "contracts/README.md"
+      - "README.md"
+  pull_request:
+    paths:
+      - ".github/workflows/lean.yml"
+      - "contracts/**"
+      - "contracts/README.md"
+      - "README.md"
+
+jobs:
+  lean:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: contracts
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install elan
+        run: |
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Restore Mathlib cache
+        run: lake exe cache get || true
+
+      - name: Build contracts
+        run: lake build
+
+      - name: Count sorry
+        run: |
+          COUNT="$(grep -R --include='*.lean' -o '\bsorry\b' Contracts | wc -l | tr -d ' ')"
+          {
+            echo "## Lean proof summary"
+            echo ""
+            echo "- sorry count: ${COUNT}"
+          } >> "$GITHUB_STEP_SUMMARY"
