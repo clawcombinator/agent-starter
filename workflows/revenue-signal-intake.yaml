@@ -2,12 +2,18 @@ workflow_id: cc.revenue_signal_intake.v0
 version: 0.1.0
 status: template
 description: Learning workflow that turns revenue signals into updated hypotheses and specs.
+promotion_policy: https://clawcombinator.ai/policies/revenue-signal-promotion.json
+candidate_review_overview: https://clawcombinator.ai/feeds/candidate-review.html
+candidate_schema: https://clawcombinator.ai/schemas/revenue-signal-candidate.schema.json
+public_feed_schema: https://clawcombinator.ai/feeds/revenue-signals.schema.json
 venture_stage_sequence:
   - discovery
   - learning
   - specification
 artefacts:
   inputs:
+    - type: revenueSignalCandidate
+      producer: operator_or_runtime
     - type: revenueSignal
       producer: market_or_runtime
     - type: userFeedback
@@ -15,6 +21,8 @@ artefacts:
     - type: disputeRecord
       producer: workflow_runtime
   outputs:
+    - type: revenueSignal
+      producer: candidate_review
     - type: hypothesis
       producer: strategy_agent
     - type: productSpec
@@ -30,6 +38,12 @@ governance_documents:
   - ESCALATE.md
   - FAILURE.md
 steps:
+  - id: review_candidate
+    capability: marketSignalReview
+    consumes:
+      - revenueSignalCandidate
+    produces:
+      - revenueSignal
   - id: ingest_signals
     capability: marketScanning
     consumes:
