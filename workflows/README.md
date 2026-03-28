@@ -8,7 +8,7 @@ governance requirements from `contracts/Contracts/CategorySpec.lean`.
 
 - `service-delivery.yaml` for escrowed delivery and settlement
 - `programme-application.yaml` for the agent-native application workflow
-- `revenue-signal-intake.yaml` for turning market evidence into learning loops
+- `market-signal-intake.yaml` for turning market evidence into learning loops
 
 ## Usage
 

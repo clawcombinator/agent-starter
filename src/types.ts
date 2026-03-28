@@ -453,7 +453,6 @@ export interface AgentCardDocument {
       | 'structuredDeliverable'
       | 'validationProof'
       | 'deployedProduct'
-      | 'revenueSignal'
       | 'reputationState'
       | 'disputeRecord';
     output_type:
@@ -468,7 +467,6 @@ export interface AgentCardDocument {
       | 'structuredDeliverable'
       | 'validationProof'
       | 'deployedProduct'
-      | 'revenueSignal'
       | 'reputationState'
       | 'disputeRecord';
     required_tier: VerificationTier;
@@ -496,7 +494,6 @@ export interface OutputContractDocument {
     | 'structuredDeliverable'
     | 'validationProof'
     | 'deployedProduct'
-    | 'revenueSignal'
     | 'reputationState'
     | 'disputeRecord';
   output_type:
@@ -511,7 +508,6 @@ export interface OutputContractDocument {
     | 'structuredDeliverable'
     | 'validationProof'
     | 'deployedProduct'
-    | 'revenueSignal'
     | 'reputationState'
     | 'disputeRecord';
   verification_tier: VerificationTier;

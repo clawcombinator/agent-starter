@@ -139,7 +139,7 @@ agent-starter/
 ├── workflows/
 │   ├── service-delivery.yaml     # Escrowed delivery template
 │   ├── programme-application.yaml# Agent-native application template
-│   └── revenue-signal-intake.yaml# Learning loop from market evidence
+│   └── market-signal-intake.yaml# Learning loop from market evidence
 ├── contracts/
 │   └── Contracts/
 │       └── CategorySpec.lean     # Canonical world model mirrored to clawcombinator.ai
@@ -174,7 +174,7 @@ public semantic kernel:
 
 - `workflows/service-delivery.yaml`
 - `workflows/programme-application.yaml`
-- `workflows/revenue-signal-intake.yaml`
+- `workflows/market-signal-intake.yaml`
 
 Treat these as structured starting points for orchestration. The artefact names,
 verification tiers, and governance requirements are chosen to match

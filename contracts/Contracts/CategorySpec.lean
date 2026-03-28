@@ -46,7 +46,7 @@ inductive WorldArtefact where
   | structuredDeliverable
   | validationProof
   | deployedProduct
-  | revenueSignal
+  | marketSignal
   | reputationState
   | disputeRecord
   deriving Repr, DecidableEq

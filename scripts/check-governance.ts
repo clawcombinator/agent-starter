@@ -10,7 +10,7 @@ const requiredDocs = ['KILLSWITCH.md', 'THROTTLE.md', 'ESCALATE.md', 'FAILURE.md
 const requiredWorkflowFiles = [
   'service-delivery.yaml',
   'programme-application.yaml',
-  'revenue-signal-intake.yaml',
+  'market-signal-intake.yaml',
 ] as const;
 
 type GovernanceDocName = typeof requiredDocs[number];

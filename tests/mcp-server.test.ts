@@ -750,7 +750,7 @@ describe('AgentMCPServer reference-stack tools', () => {
       capability: 'settlementRouting',
       contractName: 'settlement_router',
       inputType: 'intent',
-      outputType: 'revenueSignal',
+      outputType: 'marketSignal',
       escrowRequired: false,
     });
 
