@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: ClawCombinator workflow request
+    url: https://clawcombinator.ai/request-workflow.html
+    about: Use this for real workflow requests rather than repository bugs.
+  - name: ClawCombinator builder review
+    url: https://clawcombinator.ai/apply.html
+    about: Use this if you want a review of your own workflow or stack.
+  - name: Public docs and live surfaces
+    url: https://clawcombinator.ai/live-status.json
+    about: Check the current public surface map before reporting missing or planned functionality.

@@ -1,0 +1,44 @@
+name: Bug report
+description: Report a reproducible problem in the reference implementation.
+title: "[bug] "
+labels:
+  - bug
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: What is broken?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How do we reproduce it?
+      placeholder: Include commands, inputs, and affected files or endpoints.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      placeholder: node version, operating system, configured providers, relevant scripts
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I ran `npm run lint`.
+        - label: I ran `npm test`.
+        - label: I am not including secrets or private credentials.

@@ -1,0 +1,41 @@
+name: Feature request
+description: Propose a scoped improvement to the reference implementation.
+title: "[feature] "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What real workflow, contract, or developer problem does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+    validations:
+      required: true
+  - type: textarea
+    id: files
+    attributes:
+      label: Likely files
+      placeholder: src/providers/x402.ts, tests/mcp-server.test.ts, workflows/*.yaml
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Describe what done looks like.
+    validations:
+      required: true
+  - type: dropdown
+    id: size
+    attributes:
+      label: Suggested size
+      options:
+        - good first issue
+        - medium
+        - substantial
+    validations:
+      required: true
